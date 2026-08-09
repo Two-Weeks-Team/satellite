@@ -156,6 +156,14 @@ a {
   color: var(--text);
 }
 
+.header-actions {
+  align-items: center;
+  display: flex;
+  gap: 15px;
+  justify-self: end;
+  min-width: 0;
+}
+
 .source-state {
   align-items: center;
   color: var(--soft);
@@ -163,8 +171,36 @@ a {
   font-family: var(--mono);
   font-size: 9px;
   gap: 8px;
-  justify-self: end;
   letter-spacing: 0.08em;
+}
+
+.language-switcher {
+  align-items: center;
+  border-left: 1px solid var(--line);
+  display: flex;
+  gap: 7px;
+  padding-left: 14px;
+}
+
+.language-switcher > span {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 7px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.language-switcher select {
+  background: #090e12;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--soft);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 8px;
+  height: 29px;
+  outline: 0;
+  padding: 0 22px 0 7px;
 }
 
 .source-state i,
@@ -641,7 +677,8 @@ a {
 }
 
 .globe-help,
-.altitude-note {
+.altitude-note,
+.prediction-status {
   color: #667b80;
   font-family: var(--mono);
   font-size: 7px;
@@ -672,6 +709,39 @@ a {
 .altitude-note {
   right: 16px;
   top: 17px;
+}
+
+.prediction-status {
+  align-items: center;
+  background: rgba(5, 10, 13, 0.66);
+  border: 1px solid rgba(193, 255, 114, 0.16);
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  right: 16px;
+  top: 36px;
+}
+
+.prediction-status i {
+  animation: prediction-pulse 1.2s ease-in-out infinite;
+  background: var(--lime);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--lime);
+  height: 5px;
+  width: 5px;
+}
+
+.prediction-status span {
+  color: var(--lime);
+}
+
+.prediction-status b {
+  color: var(--muted);
+  font-weight: 450;
+}
+
+@keyframes prediction-pulse {
+  50% { opacity: 0.35; transform: scale(0.72); }
 }
 
 .selected-card {
@@ -1515,7 +1585,10 @@ footer > span {
 
   .app-header nav { display: none; }
   .source-state { font-size: 7px; }
-  .source-state { grid-column: 2; }
+  .header-actions { gap: 8px; grid-column: 2; }
+  .language-switcher { border-left: 0; padding-left: 0; }
+  .language-switcher > span { display: none; }
+  .language-switcher select { max-width: 86px; }
 
   .mission-intro {
     display: block;
@@ -1563,6 +1636,7 @@ footer > span {
   .selected-card dl { grid-template-columns: repeat(2, 1fr); row-gap: 10px; }
   .globe-help { left: 11px; }
   .altitude-note { bottom: 145px; right: 11px; top: auto; }
+  .prediction-status { left: 11px; right: auto; top: 39px; }
 
   .product-proof,
   .source-section {
@@ -1617,7 +1691,7 @@ footer > span {
 @media (max-width: 430px) {
   .brand { font-size: 13px; }
   .brand-mark { height: 20px; width: 20px; }
-  .source-state { letter-spacing: 0.02em; }
+  .source-state { display: none; }
   .mission-control { grid-template-rows: 42px 520px 168px 520px 520px; }
   .globe-help { gap: 4px; font-size: 6px; }
   .altitude-note { font-size: 6px; }

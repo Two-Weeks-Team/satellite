@@ -14,6 +14,7 @@ import {
   type SatRec,
 } from "satellite.js";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { detectLocale, localeFromCoordinates, localeTags, messages, type LanguageMode, type Locale } from "./i18n";
 
 type CompactOmm = [string, number, string, string, number, number, number, number, number, number, number, "U" | "C", number, number, number, number, number];
 type Category = "all" | "station" | "starlink" | "weather" | "navigation" | "science" | "other";
@@ -73,14 +74,23 @@ type GeoPosition = {
 
 type Observer = { lat: number; lon: number; label: string };
 type PassPrediction = { id: number; name: string; time: Date; maxElevation: number; azimuth: number };
+type Vector3 = { x: number; y: number; z: number };
+type MotionState = {
+  sample: GeoPosition;
+  vector: Vector3;
+  velocity: Vector3;
+  sampleAt: number;
+  correction: Vector3;
+  correctionAt: number;
+};
 
-const categoryMeta: Array<{ id: Category; label: string; short: string }> = [
-  { id: "all", label: "전체", short: "ALL" },
-  { id: "station", label: "우주정거장", short: "STN" },
-  { id: "starlink", label: "Starlink", short: "STR" },
-  { id: "weather", label: "기상", short: "WX" },
-  { id: "navigation", label: "항법", short: "NAV" },
-  { id: "science", label: "과학", short: "SCI" },
+const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
+  { id: "all", labelKey: "category.all", short: "ALL" },
+  { id: "station", labelKey: "category.station", short: "STN" },
+  { id: "starlink", labelKey: "category.starlink", short: "STR" },
+  { id: "weather", labelKey: "category.weather", short: "WX" },
+  { id: "navigation", labelKey: "category.navigation", short: "NAV" },
+  { id: "science", labelKey: "category.science", short: "SCI" },
 ];
 
 const scaleStops = [2, 25, 100, 1000];
@@ -133,18 +143,57 @@ function propagateEntry(entry: SatelliteEntry, date: Date): GeoPosition | null {
   };
 }
 
-function formatNumber(value: number, digits = 0) {
-  return new Intl.NumberFormat("ko-KR", { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
+function formatNumber(value: number, locale: Locale, digits = 0) {
+  return new Intl.NumberFormat(localeTags[locale], { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
 }
 
-function relativeTime(dateInput: string | Date, now: Date) {
+function relativeTime(dateInput: string | Date, now: Date, locale: Locale) {
   const date = new Date(dateInput);
   const minutes = Math.round((date.getTime() - now.getTime()) / 60000);
-  if (Math.abs(minutes) < 1) return "지금";
-  if (minutes > 0 && minutes < 60) return `${minutes}분 후`;
-  if (minutes > 0 && minutes < 1440) return `${Math.floor(minutes / 60)}시간 ${minutes % 60}분 후`;
-  if (minutes < 0 && minutes > -60) return `${Math.abs(minutes)}분 전`;
-  return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Seoul" }).format(date);
+  const formatter = new Intl.RelativeTimeFormat(localeTags[locale], { numeric: "auto" });
+  if (Math.abs(minutes) < 60) return formatter.format(minutes, "minute");
+  if (Math.abs(minutes) < 1440) return formatter.format(Math.round(minutes / 60), "hour");
+  return new Intl.DateTimeFormat(localeTags[locale], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function geoToVector(position: GeoPosition): Vector3 {
+  const latitude = degreesToRadians(position.lat);
+  const longitude = degreesToRadians(position.lon);
+  const radius = 1 + position.altitude / earthRadiusKm;
+  return {
+    x: Math.cos(latitude) * Math.cos(longitude) * radius,
+    y: Math.sin(latitude) * radius,
+    z: Math.cos(latitude) * Math.sin(longitude) * radius,
+  };
+}
+
+function vectorToGeo(vector: Vector3, sample: GeoPosition): GeoPosition {
+  const radius = Math.hypot(vector.x, vector.y, vector.z);
+  return {
+    ...sample,
+    lat: Math.asin(vector.y / radius) * 180 / Math.PI,
+    lon: Math.atan2(vector.z, vector.x) * 180 / Math.PI,
+    altitude: (radius - 1) * earthRadiusKm,
+  };
+}
+
+function addVector(a: Vector3, b: Vector3): Vector3 {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+function subtractVector(a: Vector3, b: Vector3): Vector3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+
+function scaleVector(vector: Vector3, amount: number): Vector3 {
+  return { x: vector.x * amount, y: vector.y * amount, z: vector.z * amount };
+}
+
+function renderedVector(state: MotionState, simulationMs: number, wallTimestamp: number): Vector3 {
+  const predicted = addVector(state.vector, scaleVector(state.velocity, simulationMs - state.sampleAt));
+  const progress = Math.max(0, Math.min(1, (wallTimestamp - state.correctionAt) / 1200));
+  const correctionWeight = (1 - progress) ** 3;
+  return addVector(predicted, scaleVector(state.correction, correctionWeight));
 }
 
 function sampleEntries(entries: SatelliteEntry[], maximum: number) {
@@ -204,6 +253,7 @@ function OrbitCanvas({
   observer,
   focusNonce,
   focusPosition,
+  locale,
   onSelect,
 }: {
   entries: SatelliteEntry[];
@@ -214,12 +264,14 @@ function OrbitCanvas({
   observer: Observer;
   focusNonce: number;
   focusPosition: GeoPosition | null;
+  locale: Locale;
   onSelect: (id: number) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({ yaw: Math.PI / 2 - degreesToRadians(126.98), pitch: degreesToRadians(20), zoom: 1 });
   const focusPositionRef = useRef(focusPosition);
   const pointsRef = useRef<GeoPosition[]>([]);
+  const motionRef = useRef<Map<number, MotionState>>(new Map());
   const hitPointsRef = useRef<Array<{ id: number; x: number; y: number; distance: number }>>([]);
   const pointerRef = useRef({ active: false, moved: false, x: 0, y: 0, yaw: 0, pitch: 0 });
 
@@ -246,9 +298,46 @@ function OrbitCanvas({
 
     const simulationDate = () => new Date((pausedAt ?? Date.now()) + timeOffset * 60000);
 
-    const refreshPositions = () => {
+    const refreshPositions = (wallTimestamp: number) => {
       const date = simulationDate();
-      pointsRef.current = entries.map((entry) => propagateEntry(entry, date)).filter((point): point is GeoPosition => point !== null);
+      const simulationMs = date.getTime();
+      const nextMotion = new Map<number, MotionState>();
+
+      entries.forEach((entry) => {
+        const measured = propagateEntry(entry, date);
+        if (!measured) return;
+        const vector = geoToVector(measured);
+        const prior = motionRef.current.get(entry.id);
+        const elapsed = prior ? simulationMs - prior.sampleAt : 0;
+
+        if (prior && elapsed > 16 && Math.abs(elapsed) < 10000) {
+          const predictionAtMeasurement = renderedVector(prior, simulationMs, wallTimestamp);
+          const observedVelocity = scaleVector(subtractVector(vector, prior.vector), 1 / elapsed);
+          const velocity = addVector(scaleVector(observedVelocity, 0.78), scaleVector(prior.velocity, 0.22));
+          nextMotion.set(entry.id, {
+            sample: measured,
+            vector,
+            velocity,
+            sampleAt: simulationMs,
+            correction: subtractVector(predictionAtMeasurement, vector),
+            correctionAt: wallTimestamp,
+          });
+          return;
+        }
+
+        const previous = propagateEntry(entry, new Date(simulationMs - 2500));
+        const previousVector = previous ? geoToVector(previous) : vector;
+        nextMotion.set(entry.id, {
+          sample: measured,
+          vector,
+          velocity: scaleVector(subtractVector(vector, previousVector), 1 / 2500),
+          sampleAt: simulationMs,
+          correction: { x: 0, y: 0, z: 0 },
+          correctionAt: wallTimestamp,
+        });
+      });
+
+      motionRef.current = nextMotion;
       const selected = entries.find((entry) => entry.id === selectedId);
       selectedTrail = selected
         ? Array.from({ length: 49 }, (_, index) => propagateEntry(selected, new Date(date.getTime() + (index - 16) * 3 * 60000))).filter((point): point is GeoPosition => point !== null)
@@ -271,11 +360,14 @@ function OrbitCanvas({
 
     const draw = (timestamp: number) => {
       if (!pausedAt && (timestamp - lastPropagation > 2500 || pointsRef.current.length === 0)) {
-        refreshPositions();
+        refreshPositions(timestamp);
         lastPropagation = timestamp;
       } else if (pointsRef.current.length === 0) {
-        refreshPositions();
+        refreshPositions(timestamp);
       }
+
+      const simulationMs = simulationDate().getTime();
+      pointsRef.current = [...motionRef.current.values()].map((state) => vectorToGeo(renderedVector(state, simulationMs, timestamp), state.sample));
 
       const bounds = canvas.getBoundingClientRect();
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -437,8 +529,9 @@ function OrbitCanvas({
       if (!reducedMotion) animationFrame = requestAnimationFrame(draw);
     };
 
-    refreshPositions();
-    draw(0);
+    const initialTimestamp = performance.now();
+    refreshPositions(initialTimestamp);
+    draw(initialTimestamp);
 
     const pointerDown = (event: PointerEvent) => {
       canvas.setPointerCapture(event.pointerId);
@@ -487,7 +580,7 @@ function OrbitCanvas({
     };
   }, [entries, selectedId, displayScale, timeOffset, pausedAt, observer, onSelect]);
 
-  return <canvas ref={canvasRef} className="live-globe" role="img" aria-label="실제 궤도요소를 SGP4로 계산한 현재 위성 위치. 마우스로 지구를 회전하고 위성을 선택할 수 있습니다." />;
+  return <canvas ref={canvasRef} className="live-globe" role="img" aria-label={messages[locale]["globe.aria"]} />;
 }
 
 function SatelliteIcon({ category }: { category: SatelliteEntry["category"] }) {
@@ -495,6 +588,8 @@ function SatelliteIcon({ category }: { category: SatelliteEntry["category"] }) {
 }
 
 export default function Home() {
+  const [locale, setLocale] = useState<Locale>("en");
+  const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [signals, setSignals] = useState<SignalsResponse | null>(null);
   const [dataError, setDataError] = useState("");
@@ -505,44 +600,72 @@ export default function Home() {
   const [displayScale, setDisplayScale] = useState(25);
   const [timeOffset, setTimeOffset] = useState(0);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
-  const [clock, setClock] = useState(Date.now());
+  const [clock, setClock] = useState(0);
   const [observer, setObserver] = useState<Observer>({ lat: 37.5665, lon: 126.978, label: "SEOUL" });
   const [locationState, setLocationState] = useState<"idle" | "loading" | "ready" | "denied">("idle");
   const [favorites, setFavorites] = useState<number[]>([]);
   const [storyMode, setStoryMode] = useState(false);
   const [focusNonce, setFocusNonce] = useState(0);
   const [activeConjunction, setActiveConjunction] = useState<Conjunction | null>(null);
+  const t = messages[locale];
+
+  useEffect(() => {
+    const hydration = window.setTimeout(() => {
+      const saved = window.localStorage.getItem("satellite-agentbase-language") as LanguageMode | null;
+      const mode = saved && ["auto", "en", "ko", "ja"].includes(saved) ? saved : "auto";
+      setLanguageMode(mode);
+      setLocale(mode === "auto" ? detectLocale() : mode);
+    }, 0);
+    return () => window.clearTimeout(hydration);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      fetch("/api/catalog").then((response) => {
-        if (!response.ok) throw new Error("위성 카탈로그를 불러오지 못했습니다.");
-        return response.json() as Promise<CatalogResponse>;
-      }),
-      fetch("/api/signals").then((response) => {
-        if (!response.ok) throw new Error("사건 피드를 불러오지 못했습니다.");
-        return response.json() as Promise<SignalsResponse>;
-      }),
-    ])
-      .then(([catalogData, signalData]) => {
-        if (cancelled) return;
-        setCatalog(catalogData);
-        setSignals(signalData);
-      })
-      .catch((error) => {
-        if (!cancelled) setDataError(error instanceof Error ? error.message : "실시간 데이터 연결에 실패했습니다.");
-      });
-    return () => { cancelled = true; };
+    const loadLiveData = () => Promise.all([
+        fetch("/api/catalog").then((response) => {
+          if (!response.ok) throw new Error(messages.en["error.catalog"]);
+          return response.json() as Promise<CatalogResponse>;
+        }),
+        fetch("/api/signals").then((response) => {
+          if (!response.ok) throw new Error(messages.en["error.signals"]);
+          return response.json() as Promise<SignalsResponse>;
+        }),
+      ])
+        .then(([catalogData, signalData]) => {
+          if (cancelled) return;
+          setCatalog(catalogData);
+          setSignals(signalData);
+          setDataError("");
+        })
+        .catch((error) => {
+          if (!cancelled) setDataError(error instanceof Error ? error.message : messages.en["error.live"]);
+        });
+
+    void loadLiveData();
+    const refresh = window.setInterval(() => void loadLiveData(), 30 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(refresh);
+    };
   }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    const saved = window.localStorage.getItem("satellite-agentbase-favorites");
-    if (saved) {
-      try { setFavorites(JSON.parse(saved)); } catch { /* ignore invalid local state */ }
-    }
-    return () => window.clearInterval(timer);
+    const hydration = window.setTimeout(() => {
+      setClock(Date.now());
+      const saved = window.localStorage.getItem("satellite-agentbase-favorites");
+      if (saved) {
+        try { setFavorites(JSON.parse(saved)); } catch { /* ignore invalid local state */ }
+      }
+    }, 0);
+    return () => {
+      window.clearInterval(timer);
+      window.clearTimeout(hydration);
+    };
   }, []);
 
   const entries = useMemo(() => {
@@ -569,7 +692,8 @@ export default function Home() {
   useEffect(() => {
     if (!selectedId && entries.length) {
       const initial = entries.find((entry) => /ISS \(ZARYA\)|^ISS$/.test(entry.name)) ?? entries.find((entry) => entry.category === "station") ?? entries[0];
-      setSelectedId(initial.id);
+      const selection = window.setTimeout(() => setSelectedId(initial.id), 0);
+      return () => window.clearTimeout(selection);
     }
   }, [entries, selectedId]);
 
@@ -599,12 +723,13 @@ export default function Home() {
     return [...favoriteEntries, ...featured.filter((entry) => !favorites.includes(entry.id))].slice(0, 10);
   }, [entries, query, favorites, featured]);
 
+  const passTimeBucket = Math.floor(simulationTime.getTime() / 600000);
   const passPredictions = useMemo(() => {
     const candidates = [...(selectedEntry ? [selectedEntry] : []), ...featured].filter((entry, index, array) => array.findIndex((item) => item.id === entry.id) === index).slice(0, 14);
     return candidates.map((entry) => findNextPass(entry, observer, simulationTime)).filter((pass): pass is PassPrediction => Boolean(pass)).sort((a, b) => a.time.getTime() - b.time.getTime()).slice(0, 6);
     // Rounded clock keeps this calculation from running every second.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [featured, selectedEntry, observer.lat, observer.lon, Math.floor(simulationTime.getTime() / 600000)]);
+  }, [featured, selectedEntry, observer.lat, observer.lon, passTimeBucket]);
 
   useEffect(() => {
     if (!storyMode || featured.length < 2) return;
@@ -637,6 +762,7 @@ export default function Home() {
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setObserver({ lat: position.coords.latitude, lon: position.coords.longitude, label: "MY LOCATION" });
+        if (languageMode === "auto") setLocale(localeFromCoordinates(position.coords.latitude, position.coords.longitude) ?? detectLocale());
         setLocationState("ready");
         setPanelTab("sky");
       },
@@ -659,59 +785,85 @@ export default function Home() {
   };
 
   const dataState = catalog?.status === "live" ? "LIVE" : catalog ? "CACHED" : dataError ? "OFFLINE" : "CONNECTING";
+  const trackingTitle = selectedEntry
+    ? locale === "ko" ? `${selectedEntry.name}을(를) 추적 중입니다.` : locale === "ja" ? `${selectedEntry.name}を追跡中です。` : `Tracking ${selectedEntry.name}.`
+    : t["discover.connecting"];
+  const trackingBody = selectedPosition
+    ? locale === "ko"
+      ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. 화면은 두 최신 위치의 이동 벡터를 예측하고 다음 SGP4 값으로 부드럽게 보정합니다.`
+      : locale === "ja"
+        ? `現在、高度${selectedPosition.altitude.toFixed(0)} kmを${selectedPosition.velocity.toFixed(2)} km/sで移動中です。直近2点の移動ベクトルでフレームを予測し、次のSGP4値へ滑らかに補正します。`
+        : `Moving at ${selectedPosition.velocity.toFixed(2)} km/s, ${selectedPosition.altitude.toFixed(0)} km above Earth. Frames extrapolate the two latest positions, then ease into the next SGP4 solution.`
+    : t["discover.loading"];
+  const changeLanguage = (mode: LanguageMode) => {
+    setLanguageMode(mode);
+    window.localStorage.setItem("satellite-agentbase-language", mode);
+    setLocale(mode === "auto" ? detectLocale() : mode);
+  };
 
   return (
     <div className="app-shell" id="top">
       <header className="app-header">
-        <a className="brand" href="#top" aria-label="satellite.agentba.se 홈">
+        <a className="brand" href="#top" aria-label={t.home}>
           <span className="brand-mark" aria-hidden="true"><i /></span>
           <span>satellite<span>.agentba.se</span></span>
         </a>
-        <nav aria-label="주요 메뉴">
+        <nav aria-label={t.nav}>
           <a href="#mission">MISSION</a>
           <a href="#why">WHY DIFFERENT</a>
           <a href="#sources">SOURCES</a>
         </nav>
-        <div className={`source-state source-state--${dataState.toLowerCase()}`}><i /> {dataState} · {catalog ? formatNumber(catalog.count) : "—"} OBJECTS</div>
+        <div className="header-actions">
+          <div className={`source-state source-state--${dataState.toLowerCase()}`}><i /> {dataState} · {catalog ? formatNumber(catalog.count, locale) : "—"} OBJECTS</div>
+          <label className="language-switcher">
+            <span>{t["language.label"]}</span>
+            <select value={languageMode} onChange={(event) => changeLanguage(event.target.value as LanguageMode)} aria-label={t["language.label"]}>
+              <option value="auto">{t["language.auto"]} · {locale.toUpperCase()}</option>
+              <option value="en">EN</option>
+              <option value="ko">한국어</option>
+              <option value="ja">日本語</option>
+            </select>
+          </label>
+        </div>
       </header>
 
       <main>
         <section className="mission-intro">
           <div>
             <p className="kicker"><span>LIVE ORBITAL INTELLIGENCE</span> / SGP4 PROPAGATION</p>
-            <h1>우주는 지금도<br /><em>사건을 만들고 있습니다.</em></h1>
+            <h1>{t["hero.line1"]}<br /><em>{t["hero.line2"]}</em></h1>
           </div>
-          <p>수만 개의 궤도를 직접 뒤지지 마세요. 실제 위치·근접접근·추락 후보·우주기상을 한 화면에서 읽고, 에이전트가 지금 볼 이유를 먼저 설명합니다.</p>
+          <p>{t["hero.body"]}</p>
         </section>
 
-        <section className="mission-control" id="mission" aria-label="실시간 위성 관제 화면">
+        <section className="mission-control" id="mission" aria-label={t["mission.aria"]}>
           <div className="mission-topbar">
             <div><span className="live-pulse" /> EARTH ORBIT / {dataState}</div>
             <div className="topbar-metrics">
-              <span>SIM TIME <b>{new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "Asia/Seoul", hour12: false }).format(simulationTime)} KST</b></span>
-              <span>OBSERVER <b>{observer.label}</b></span>
+              <span>SIM TIME <b>{new Intl.DateTimeFormat(localeTags[locale], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(simulationTime)} LOCAL</b></span>
+              <span>OBSERVER <b>{observer.label === "MY LOCATION" ? t["observer.myLocation"] : observer.label}</b></span>
               <span>SOURCE <b>{catalog?.source ?? "CONNECTING"}</b></span>
             </div>
           </div>
 
-          <aside className="catalog-panel" aria-label="위성 검색과 필터">
-            <div className="panel-title"><span>01</span><div><small>CATALOG</small><strong>찾고, 저장하고, 추적하기</strong></div></div>
+          <aside className="catalog-panel" aria-label={t["catalog.aria"]}>
+            <div className="panel-title"><span>01</span><div><small>CATALOG</small><strong>{t["catalog.subtitle"]}</strong></div></div>
             <label className="search-box">
               <span aria-hidden="true">⌕</span>
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="이름 또는 NORAD 번호" aria-label="위성 검색" />
-              {query && <button type="button" onClick={() => setQuery("")} aria-label="검색어 지우기">×</button>}
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t["search.placeholder"]} aria-label={t["search.label"]} />
+              {query && <button type="button" onClick={() => setQuery("")} aria-label={t["search.clear"]}>×</button>}
             </label>
-            <div className="category-grid" role="group" aria-label="위성 유형 필터">
+            <div className="category-grid" role="group" aria-label={t["category.aria"]}>
               {categoryMeta.map((category) => (
                 <button key={category.id} type="button" className={filter === category.id ? "active" : ""} aria-pressed={filter === category.id} onClick={() => setFilter(category.id)}>
-                  <span>{category.short}</span><b>{category.label}</b><small>{formatNumber(categoryCounts[category.id] ?? 0)}</small>
+                  <span>{category.short}</span><b>{t[category.labelKey]}</b><small>{formatNumber(categoryCounts[category.id] ?? 0, locale)}</small>
                 </button>
               ))}
             </div>
             <div className="catalog-list-head"><span>{query ? "SEARCH RESULTS" : favorites.length ? "FAVORITES + SPOTLIGHT" : "SPOTLIGHT"}</span><small>{searchResults.length} SHOWN</small></div>
             <div className="catalog-list" aria-live="polite">
               {!catalog && !dataError && Array.from({ length: 5 }, (_, index) => <div className="catalog-skeleton" key={index} />)}
-              {dataError && <div className="empty-state"><span>!</span><p>{dataError}</p></div>}
+              {dataError && <div className="empty-state"><span>!</span><p>{t["error.live"]}</p></div>}
               {searchResults.map((entry) => (
                 <button type="button" key={entry.id} className={selectedId === entry.id ? "catalog-row active" : "catalog-row"} onClick={() => selectAndFocus(entry.id)}>
                   <SatelliteIcon category={entry.category} />
@@ -720,7 +872,7 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <button type="button" className="surprise-button" onClick={pickSurprise}><span>✦</span> 지금 흥미로운 위성으로 이동 <b>↗</b></button>
+            <button type="button" className="surprise-button" onClick={pickSurprise}><span>✦</span> {t.surprise} <b>↗</b></button>
           </aside>
 
           <div className="globe-stage">
@@ -733,39 +885,41 @@ export default function Home() {
               observer={observer}
               focusNonce={focusNonce}
               focusPosition={selectedPosition}
+              locale={locale}
               onSelect={setSelectedId}
             />
             <div className="globe-grid" aria-hidden="true" />
-            <div className="globe-help"><span>DRAG</span> 회전 <i /> <span>SCROLL</span> 확대 <i /> <span>CLICK</span> 추적</div>
+            <div className="globe-help"><span>DRAG</span> {t["globe.drag"]} <i /> <span>SCROLL</span> {t["globe.scroll"]} <i /> <span>CLICK</span> {t["globe.click"]}</div>
+            <div className="prediction-status"><i /><span>{t["prediction.label"]}</span><b>{t["prediction.detail"]}</b></div>
             <div className="altitude-note">ALTITUDE VISUALLY COMPRESSED · POSITION IS SGP4</div>
             {selectedEntry && selectedPosition && (
               <article className="selected-card" aria-live="polite">
                 <div className="selected-card__head">
                   <span className={`category-badge category-badge--${selectedEntry.category}`}>{selectedEntry.category.toUpperCase()}</span>
-                  <button type="button" aria-label={favorites.includes(selectedEntry.id) ? "즐겨찾기 해제" : "즐겨찾기 추가"} onClick={() => toggleFavorite(selectedEntry.id)}>{favorites.includes(selectedEntry.id) ? "★" : "☆"}</button>
+                  <button type="button" aria-label={favorites.includes(selectedEntry.id) ? t["favorite.remove"] : t["favorite.add"]} onClick={() => toggleFavorite(selectedEntry.id)}>{favorites.includes(selectedEntry.id) ? "★" : "☆"}</button>
                 </div>
                 <h2>{selectedEntry.name}</h2>
                 <p>NORAD {selectedEntry.id} · {selectedEntry.objectId || "DESIGNATOR N/A"}</p>
                 <dl>
-                  <div><dt>고도</dt><dd>{formatNumber(selectedPosition.altitude)} <small>km</small></dd></div>
-                  <div><dt>속도</dt><dd>{formatNumber(selectedPosition.velocity, 2)} <small>km/s</small></dd></div>
-                  <div><dt>위도</dt><dd>{formatNumber(selectedPosition.lat, 2)}<small>°</small></dd></div>
-                  <div><dt>경도</dt><dd>{formatNumber(selectedPosition.lon, 2)}<small>°</small></dd></div>
+                  <div><dt>{t["metric.altitude"]}</dt><dd>{formatNumber(selectedPosition.altitude, locale)} <small>km</small></dd></div>
+                  <div><dt>{t["metric.speed"]}</dt><dd>{formatNumber(selectedPosition.velocity, locale, 2)} <small>km/s</small></dd></div>
+                  <div><dt>{t["metric.latitude"]}</dt><dd>{formatNumber(selectedPosition.lat, locale, 2)}<small>°</small></dd></div>
+                  <div><dt>{t["metric.longitude"]}</dt><dd>{formatNumber(selectedPosition.lon, locale, 2)}<small>°</small></dd></div>
                 </dl>
                 <div className="selected-actions">
-                  <button type="button" onClick={() => setFocusNonce((value) => value + 1)}>화면 중앙에 놓기</button>
-                  <button type="button" className={storyMode ? "active" : ""} aria-pressed={storyMode} onClick={() => setStoryMode((value) => !value)}>{storyMode ? "스토리 정지" : "스토리 투어"}</button>
+                  <button type="button" onClick={() => setFocusNonce((value) => value + 1)}>{t["selected.center"]}</button>
+                  <button type="button" className={storyMode ? "active" : ""} aria-pressed={storyMode} onClick={() => setStoryMode((value) => !value)}>{storyMode ? t["story.stop"] : t["story.start"]}</button>
                 </div>
               </article>
             )}
           </div>
 
-          <aside className="agent-panel" aria-label="실시간 에이전트 브리핑">
-            <div className="panel-title"><span>02</span><div><small>AGENT BRIEF</small><strong>지금 알아야 할 것</strong></div></div>
-            <div className="agent-tabs" role="tablist" aria-label="브리핑 유형">
+          <aside className="agent-panel" aria-label={t["agent.aria"]}>
+            <div className="panel-title"><span>02</span><div><small>AGENT BRIEF</small><strong>{t["agent.subtitle"]}</strong></div></div>
+            <div className="agent-tabs" role="tablist" aria-label={t["tabs.aria"]}>
               {(["discover", "risk", "sky"] as PanelTab[]).map((tab) => (
                 <button key={tab} type="button" role="tab" aria-selected={panelTab === tab} className={panelTab === tab ? "active" : ""} onClick={() => setPanelTab(tab)}>
-                  {tab === "discover" ? "발견" : tab === "risk" ? "위험" : "내 하늘"}
+                  {tab === "discover" ? t["tab.discover"] : tab === "risk" ? t["tab.risk"] : t["tab.sky"]}
                   {tab === "risk" && signals?.conjunctions.length ? <i>{signals.conjunctions.length}</i> : null}
                 </button>
               ))}
@@ -774,34 +928,34 @@ export default function Home() {
             {panelTab === "discover" && (
               <div className="agent-scroll">
                 <article className="agent-lead agent-lead--fun">
-                  <div><span>✦ LIVE DISCOVERY</span><time>{relativeTime(simulationTime, simulationTime)}</time></div>
-                  <h3>{selectedEntry ? `${selectedEntry.name}을(를) 추적 중입니다.` : "실시간 카탈로그 연결 중"}</h3>
-                  <p>{selectedPosition ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. 궤도선을 따라 다음 96분의 움직임을 확인할 수 있습니다.` : "최신 궤도요소를 내려받아 현재 위치를 계산하고 있습니다."}</p>
+                  <div><span>✦ LIVE DISCOVERY</span><time>{relativeTime(simulationTime, simulationTime, locale)}</time></div>
+                  <h3>{trackingTitle}</h3>
+                  <p>{trackingBody}</p>
                 </article>
                 <div className="weather-card">
                   <div className="kp-gauge"><span style={{ "--kp": `${Math.min(100, ((signals?.spaceWeather?.kp ?? 0) / 9) * 100)}%` } as React.CSSProperties} /><b>Kp {signals?.spaceWeather ? signals.spaceWeather.kp.toFixed(1) : "—"}</b></div>
-                  <div><span>NOAA SPACE WEATHER</span><strong>{signals?.spaceWeather ? ({ quiet: "조용한 우주환경", active: "활동 증가", storm: "지자기 폭풍", severe: "강한 지자기 폭풍" }[signals.spaceWeather.level]) : "연결 확인 중"}</strong><small>{signals?.spaceWeather ? relativeTime(signals.spaceWeather.time, simulationTime) : "NOAA SWPC"}</small></div>
+                  <div><span>NOAA SPACE WEATHER</span><strong>{signals?.spaceWeather ? t[`weather.${signals.spaceWeather.level}`] : t["weather.connecting"]}</strong><small>{signals?.spaceWeather ? relativeTime(signals.spaceWeather.time, simulationTime, locale) : "NOAA SWPC"}</small></div>
                 </div>
                 <div className="insight-grid">
-                  <article><span>CATALOG</span><strong>{formatNumber(entries.length)}</strong><small>활성 물체</small></article>
-                  <article><span>ON SCREEN</span><strong>{formatNumber(renderEntries.length)}</strong><small>실시간 전파</small></article>
-                  <article><span>DECAY</span><strong>{signals?.decays.length ?? "—"}</strong><small>추락 후보</small></article>
-                  <article><span>PASSES</span><strong>{passPredictions.length}</strong><small>12시간 내</small></article>
+                  <article><span>CATALOG</span><strong>{formatNumber(entries.length, locale)}</strong><small>{t["insight.active"]}</small></article>
+                  <article><span>ON SCREEN</span><strong>{formatNumber(renderEntries.length, locale)}</strong><small>{t["insight.predicted"]}</small></article>
+                  <article><span>DECAY</span><strong>{signals?.decays.length ?? "—"}</strong><small>{t["insight.decay"]}</small></article>
+                  <article><span>PASSES</span><strong>{passPredictions.length}</strong><small>{t["insight.passes"]}</small></article>
                 </div>
-                <button type="button" className="agent-action" onClick={pickSurprise}>에이전트에게 다음 장면 맡기기 <span>→</span></button>
+                <button type="button" className="agent-action" onClick={pickSurprise}>{t["agent.action"]} <span>→</span></button>
               </div>
             )}
 
             {panelTab === "risk" && (
               <div className="agent-scroll risk-list">
-                <div className="risk-disclaimer"><span>!</span><p>SOCRATES 공개 GP 기반 선별입니다. 실제 충돌 회피 판단이나 안전 운용에 사용하면 안 됩니다.</p></div>
+                <div className="risk-disclaimer"><span>!</span><p>{t["risk.disclaimer"]}</p></div>
                 {signals?.conjunctions.length ? signals.conjunctions.slice(0, 7).map((event, index) => (
                   <button type="button" key={`${event.id1}-${event.id2}-${event.tca}`} className={activeConjunction === event ? "risk-row active" : "risk-row"} onClick={() => openConjunction(event)}>
                     <span className="risk-index">0{index + 1}</span>
-                    <div><small>{relativeTime(event.tca, simulationTime)} · {event.relativeSpeed.toFixed(2)} km/s</small><strong>{event.name1.replace(/\s\[[^\]]+\]$/, "")}</strong><i>×</i><strong>{event.name2.replace(/\s\[[^\]]+\]$/, "")}</strong></div>
+                    <div><small>{relativeTime(event.tca, simulationTime, locale)} · {event.relativeSpeed.toFixed(2)} km/s</small><strong>{event.name1.replace(/\s\[[^\]]+\]$/, "")}</strong><i>×</i><strong>{event.name2.replace(/\s\[[^\]]+\]$/, "")}</strong></div>
                     <b>{event.rangeKm < 1 ? `${Math.round(event.rangeKm * 1000)} m` : `${event.rangeKm.toFixed(2)} km`}</b>
                   </button>
-                )) : <div className="empty-state"><span>◌</span><p>{signals ? "현재 SOCRATES 피드를 불러오지 못했습니다." : "근접접근 피드 연결 중"}</p></div>}
+                )) : <div className="empty-state"><span>◌</span><p>{signals ? t["risk.unavailable"] : t["risk.connecting"]}</p></div>}
                 {signals?.decays.slice(0, 4).map((decay) => (
                   <button type="button" key={decay.id} className="decay-row" onClick={() => { const entry = entries.find((item) => item.id === decay.id); if (entry) selectAndFocus(entry.id); }}>
                     <span>DECAY WATCH</span><strong>{decay.name}</strong><small>NORAD {decay.id} · BSTAR {decay.bstar.toExponential(2)}</small>
@@ -813,56 +967,56 @@ export default function Home() {
             {panelTab === "sky" && (
               <div className="agent-scroll sky-list">
                 <div className="observer-card">
-                  <div><span>OBSERVER</span><strong>{observer.label}</strong><small>{observer.lat.toFixed(3)}°, {observer.lon.toFixed(3)}°</small></div>
-                  <button type="button" onClick={locateMe} disabled={locationState === "loading"}>{locationState === "loading" ? "찾는 중" : "내 위치 사용"}</button>
+                  <div><span>OBSERVER</span><strong>{observer.label === "MY LOCATION" ? t["observer.myLocation"] : observer.label}</strong><small>{observer.lat.toFixed(3)}°, {observer.lon.toFixed(3)}°</small></div>
+                  <button type="button" onClick={locateMe} disabled={locationState === "loading"}>{locationState === "loading" ? t["observer.loading"] : t["observer.use"]}</button>
                 </div>
-                {locationState === "denied" && <p className="location-error">위치 권한을 사용할 수 없어 서울을 기준으로 계산합니다.</p>}
-                <div className="pass-note">고도 10° 이상인 기하학적 통과 예측입니다. 밝기·구름·태양광 조건은 포함하지 않습니다.</div>
+                {locationState === "denied" && <p className="location-error">{t["observer.denied"]}</p>}
+                <div className="pass-note">{t["pass.note"]}</div>
                 {passPredictions.map((pass, index) => (
                   <button type="button" key={`${pass.id}-${pass.time.toISOString()}`} className="pass-row" onClick={() => selectAndFocus(pass.id)}>
                     <span>{String(index + 1).padStart(2, "0")}</span>
-                    <div><strong>{pass.name}</strong><small>{relativeTime(pass.time, simulationTime)} · 방위 {Math.round(pass.azimuth)}°</small></div>
+                    <div><strong>{pass.name}</strong><small>{relativeTime(pass.time, simulationTime, locale)} · {t["pass.azimuth"]} {Math.round(pass.azimuth)}°</small></div>
                     <b>{Math.round(pass.maxElevation)}°</b>
                   </button>
                 ))}
-                {!passPredictions.length && <div className="empty-state"><span>◌</span><p>선택한 주요 위성에서 12시간 내 통과를 찾지 못했습니다.</p></div>}
+                {!passPredictions.length && <div className="empty-state"><span>◌</span><p>{t["pass.none"]}</p></div>}
               </div>
             )}
           </aside>
 
           <div className="mission-controls">
             <div className="time-control">
-              <button type="button" aria-label={pausedAt ? "시간 재생" : "시간 일시정지"} onClick={() => setPausedAt((value) => value ? null : Date.now())}>{pausedAt ? "▶" : "Ⅱ"}</button>
+              <button type="button" aria-label={pausedAt ? t["time.play"] : t["time.pause"]} onClick={() => setPausedAt((value) => value ? null : Date.now())}>{pausedAt ? "▶" : "Ⅱ"}</button>
               <div><span>TIME TRAVEL</span><strong>{timeOffset === 0 ? "NOW" : timeOffset < 0 ? `${Math.abs(timeOffset)}M AGO` : `+${Math.floor(timeOffset / 60)}H ${timeOffset % 60}M`}</strong></div>
-              <input type="range" min="-90" max="1440" step="15" value={timeOffset} aria-label="궤도 시간 이동" aria-valuetext={simulationTime.toLocaleString("ko-KR")} onChange={(event) => setTimeOffset(Number(event.target.value))} />
+              <input type="range" min="-90" max="1440" step="15" value={timeOffset} aria-label={t["time.slider"]} aria-valuetext={simulationTime.toLocaleString(localeTags[locale])} onChange={(event) => setTimeOffset(Number(event.target.value))} />
               <div className="time-presets"><button type="button" onClick={() => setTimeOffset(-60)}>−1H</button><button type="button" className={timeOffset === 0 ? "active" : ""} onClick={() => setTimeOffset(0)}>NOW</button><button type="button" onClick={() => setTimeOffset(360)}>+6H</button><button type="button" onClick={() => setTimeOffset(1440)}>+24H</button></div>
             </div>
             <div className="display-control">
               <div><span>OBJECT DISPLAY</span><strong>{displayScale}×</strong></div>
-              <input type="range" min="1" max={Math.log2(1000)} step="0.01" value={Math.log2(displayScale)} aria-label="위성 표시 크기" aria-valuetext={`${displayScale}배`} onChange={(event) => setDisplayScale(Math.round(2 ** Number(event.target.value)))} />
+              <input type="range" min="1" max={Math.log2(1000)} step="0.01" value={Math.log2(displayScale)} aria-label={t["display.slider"]} aria-valuetext={`${displayScale}×`} onChange={(event) => setDisplayScale(Math.round(2 ** Number(event.target.value)))} />
               <div>{scaleStops.map((stop) => <button type="button" key={stop} className={displayScale === stop ? "active" : ""} aria-pressed={displayScale === stop} onClick={() => setDisplayScale(stop)}>{stop}×</button>)}</div>
             </div>
           </div>
         </section>
 
         <section className="product-proof" id="why">
-          <div className="section-heading"><p>03 / WHY DIFFERENT</p><h2>점을 많이 보여주는 경쟁이 아니라,<br /><em>다음 행동을 쉽게 만드는 경험.</em></h2></div>
+          <div className="section-heading"><p>03 / WHY DIFFERENT</p><h2>{t["why.line1"]}<br /><em>{t["why.line2"]}</em></h2></div>
           <div className="proof-grid">
-            <article><span>01</span><div className="proof-visual proof-visual--focus"><i /><i /><i /><b>✦</b></div><h3>사건 중심 탐색</h3><p>위험·추락·우주기상·관측 기회를 데이터 목록이 아니라 “왜 지금 봐야 하는지”로 설명합니다.</p></article>
-            <article><span>02</span><div className="proof-visual proof-visual--time"><b>−1H</b><i /><strong>NOW</strong><i /><b>+24H</b></div><h3>한 화면의 시간여행</h3><p>실시간 위치부터 24시간 뒤 궤도까지 화면을 떠나지 않고 비교합니다. 모든 위치는 같은 SGP4 계산을 사용합니다.</p></article>
-            <article><span>03</span><div className="proof-visual proof-visual--sky"><i /><b>37°</b><span>MY SKY</span></div><h3>내 하늘과 바로 연결</h3><p>위치 버튼 한 번으로 주요 위성의 다음 통과를 계산하고, 해당 물체로 즉시 지구를 회전합니다.</p></article>
+            <article><span>01</span><div className="proof-visual proof-visual--focus"><i /><i /><i /><b>✦</b></div><h3>{t["proof.events.title"]}</h3><p>{t["proof.events.body"]}</p></article>
+            <article><span>02</span><div className="proof-visual proof-visual--time"><b>−1H</b><i /><strong>NOW</strong><i /><b>+24H</b></div><h3>{t["proof.time.title"]}</h3><p>{t["proof.time.body"]}</p></article>
+            <article><span>03</span><div className="proof-visual proof-visual--sky"><i /><b>37°</b><span>MY SKY</span></div><h3>{t["proof.sky.title"]}</h3><p>{t["proof.sky.body"]}</p></article>
           </div>
         </section>
 
         <section className="source-section" id="sources">
-          <div className="section-heading"><p>04 / DATA TRANSPARENCY</p><h2>실시간이라는 말보다,<br /><em>출처와 한계를 함께 보여줍니다.</em></h2></div>
+          <div className="section-heading"><p>04 / DATA TRANSPARENCY</p><h2>{t["sources.line1"]}<br /><em>{t["sources.line2"]}</em></h2></div>
           <div className="source-table">
-            <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer"><span>ORBITAL ELEMENTS</span><strong>CelesTrak OMM / USSF GP</strong><small>2시간 캐시 · 9자리 카탈로그 대응</small><b>↗</b></a>
-            <a href="https://celestrak.org/SOCRATES/socrates-format.php" target="_blank" rel="noreferrer"><span>CONJUNCTIONS</span><strong>SOCRATES Plus</strong><small>공개 GP 기반 7일 근접접근 선별</small><b>↗</b></a>
-            <a href="https://services.swpc.noaa.gov/products/" target="_blank" rel="noreferrer"><span>SPACE WEATHER</span><strong>NOAA SWPC</strong><small>Planetary K-index 실시간 제품</small><b>↗</b></a>
-            <div><span>PROPAGATION</span><strong>satellite.js / SGP4</strong><small>브라우저에서 현재 위치·통과 계산</small><b>✓</b></div>
+            <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer"><span>ORBITAL ELEMENTS</span><strong>CelesTrak OMM / USSF GP</strong><small>{t["source.orbits"]}</small><b>↗</b></a>
+            <a href="https://celestrak.org/SOCRATES/socrates-format.php" target="_blank" rel="noreferrer"><span>CONJUNCTIONS</span><strong>SOCRATES Plus</strong><small>{t["source.conjunctions"]}</small><b>↗</b></a>
+            <a href="https://services.swpc.noaa.gov/products/" target="_blank" rel="noreferrer"><span>SPACE WEATHER</span><strong>NOAA SWPC</strong><small>{t["source.weather"]}</small><b>↗</b></a>
+            <div><span>PROPAGATION</span><strong>satellite.js / SGP4</strong><small>{t["source.propagation"]}</small><b>✓</b></div>
           </div>
-          <p className="accuracy-note">이 서비스는 교육·탐색용입니다. 공개 GP 궤도요소에는 관측 오차와 갱신 지연이 있으며, 충돌 회피·항법·안전 운용 등 임무 핵심 판단에 사용할 수 없습니다.</p>
+          <p className="accuracy-note">{t.accuracy}</p>
         </section>
       </main>
 

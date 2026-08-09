@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "satellite.agentba.se",
-  description: "위성을 실체로 보여주고, 중요한 궤도 사건을 먼저 알려주는 지능형 위성 추적 플랫폼.",
+  description: "Live orbital intelligence with predictive motion, SGP4 reconciliation, close-approach signals and local sky passes.",
   other: {
     "codex-preview": "development",
   },
@@ -26,7 +26,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="ko">
+    <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable}`}>{children}</body>
     </html>
   );
