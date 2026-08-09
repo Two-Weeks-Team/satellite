@@ -68,14 +68,17 @@ function parseConjunctions(html: string) {
 }
 
 function currentKp(rows: unknown) {
-  if (!Array.isArray(rows) || rows.length < 2) return null;
-  const header = rows[0] as string[];
-  const data = rows[rows.length - 1] as string[];
-  const record = Object.fromEntries(header.map((key, index) => [key, data[index]]));
-  const kp = Number(record.Kp ?? record.kp_index ?? 0);
+  if (!Array.isArray(rows) || rows.length < 1) return null;
+  const latest = rows[rows.length - 1];
+  const record = Array.isArray(latest) && Array.isArray(rows[0])
+    ? Object.fromEntries((rows[0] as string[]).map((key, index) => [key, latest[index]]))
+    : latest as Record<string, unknown>;
+  if (!record || typeof record !== "object") return null;
+  const kp = Number(record.Kp ?? record.estimated_kp ?? record.kp_index);
+  if (!Number.isFinite(kp)) return null;
   return {
     time: String(record.time_tag ?? new Date().toISOString()),
-    kp: Number.isFinite(kp) ? kp : 0,
+    kp,
     level: kp >= 7 ? "severe" : kp >= 5 ? "storm" : kp >= 4 ? "active" : "quiet",
   };
 }
