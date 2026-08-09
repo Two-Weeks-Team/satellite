@@ -264,7 +264,7 @@ function OrbitCanvas({ scale, mode }: { scale: number; mode: "all" | EventKind }
       });
 
       frame += 1;
-      animationFrame = window.requestAnimationFrame(draw);
+      if (!reduceMotion) animationFrame = window.requestAnimationFrame(draw);
     };
 
     draw();
@@ -340,7 +340,7 @@ export default function Home() {
         <button
           className="menu-button"
           type="button"
-          aria-label="메뉴 열기"
+          aria-label={menuOpen ? "메뉴 닫기" : "메뉴 열기"}
           aria-expanded={menuOpen}
           onClick={() => setMenuOpen((open) => !open)}
         >
@@ -361,7 +361,7 @@ export default function Home() {
               수만 개의 궤도가 이제 하나의 이야기로 읽힙니다.
             </p>
             <div className="hero-actions">
-              <a className="primary-button" href="#scale-lab">스케일을 바꿔보기 <span>↘</span></a>
+              <a className="primary-button" href="#scale-lab">프리셋으로 확대하기 <span>↘</span></a>
               <a className="text-button" href="#agent">에이전트 브리핑 보기 <span>→</span></a>
             </div>
             <dl className="hero-metrics">
@@ -371,7 +371,7 @@ export default function Home() {
             </dl>
           </div>
 
-          <div className="mission-panel" aria-label="인터랙티브 위성 궤도 데모">
+          <div className="mission-panel" role="region" aria-label="인터랙티브 위성 궤도 데모">
             <div className="mission-toolbar">
               <div className="mission-title"><span className="crosshair">＋</span> EARTH ORBIT / LIVE VIEW</div>
               <div className="mission-clock"><span>SEOUL</span> {clock} KST</div>
@@ -397,7 +397,7 @@ export default function Home() {
                 </button>
               ))}
 
-              <aside className="object-card" aria-live="polite">
+              <aside className="object-card" aria-label="선택한 위성 정보" aria-live="polite">
                 <div className="object-card__topline">
                   <span>SELECTED OBJECT</span>
                   <span className={`tone-dot tone-dot--${chosenSatellite.tone}`} />
@@ -413,10 +413,10 @@ export default function Home() {
                 </dl>
               </aside>
 
-              <aside className="agent-feed">
+              <aside className="agent-feed" aria-label="AI 에이전트 이벤트 피드">
                 <div className="agent-feed__head">
                   <div><span className="agent-spark">✦</span> AGENT SIGNALS</div>
-                  <span>{visibleEvents.length} ACTIVE</span>
+                  <span>{Math.min(visibleEvents.length, 3)} / {visibleEvents.length} SHOWN</span>
                 </div>
                 <div className="mode-tabs" role="group" aria-label="이벤트 유형 필터">
                   {(["all", "risk", "fun"] as const).map((filter) => (
@@ -467,7 +467,7 @@ export default function Home() {
               />
               <div className="scale-stops">
                 {scaleStops.map((stop) => (
-                  <button type="button" key={stop} className={scale === stop ? "active" : ""} onClick={() => setScale(stop)}>{stop}×</button>
+                  <button type="button" key={stop} className={scale === stop ? "active" : ""} aria-pressed={scale === stop} onClick={() => setScale(stop)}>{stop}×</button>
                 ))}
               </div>
               <div className="simulation-note"><span>SIM</span> 위성 표시 크기만 확대 · 실제 경보가 아닙니다</div>
@@ -499,7 +499,7 @@ export default function Home() {
                 <SatelliteGlyph size="large" />
               </div>
               <div className="scale-demo__label"><span>ISS (ZARYA)</span><strong>{scale}×</strong></div>
-              <div className="scale-demo__hint">SLIDE TO REVEAL THE OBJECT</div>
+              <div className="scale-demo__hint">CHOOSE A PRESET TO REVEAL THE OBJECT</div>
             </div>
             <div className="scale-narrative">
               <span className="chapter-number">02—A</span>
@@ -510,7 +510,7 @@ export default function Home() {
               </p>
               <div className="scale-presets" role="group" aria-label="위성 배율 프리셋">
                 {scaleStops.map((stop, index) => (
-                  <button type="button" key={stop} className={scale === stop ? "active" : ""} onClick={() => setScale(stop)}>
+                  <button type="button" key={stop} className={scale === stop ? "active" : ""} aria-pressed={scale === stop} onClick={() => setScale(stop)}>
                     <span>0{index + 1}</span><strong>{stop}×</strong><small>{["FLOW", "CLUSTER", "IDENTITY", "STRUCTURE"][index]}</small>
                   </button>
                 ))}
@@ -563,7 +563,7 @@ export default function Home() {
             </div>
             <div className="briefing-events">
               {events.map((event) => (
-                <button type="button" key={event.id} className={activeEvent === event.id ? "active" : ""} onClick={() => selectEvent(event)}>
+                <button type="button" key={event.id} className={activeEvent === event.id ? "active" : ""} aria-pressed={activeEvent === event.id} onClick={() => selectEvent(event)}>
                   <span className={`event-kind event-kind--${event.kind}`} />
                   <b>{event.label}</b><small>{event.timing}</small>
                 </button>
