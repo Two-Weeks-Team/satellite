@@ -13,7 +13,12 @@ import {
   type OMMJsonObject,
   type SatRec,
 } from "satellite.js";
+import { geoGraticule10, geoOrthographic, geoPath } from "d3-geo";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { feature, mesh } from "topojson-client";
+import type { GeometryCollection, Topology } from "topojson-specification";
+import world50Url from "world-atlas/countries-50m.json?url";
+import world110Source from "world-atlas/countries-110m.json";
 import { detectLocale, localeFromCoordinates, localeTags, messages, type LanguageMode, type Locale } from "./i18n";
 
 type CompactOmm = [string, number, string, string, number, number, number, number, number, number, number, "U" | "C", number, number, number, number, number];
@@ -151,15 +156,27 @@ const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
 
 const scaleStops = [2, 25, 100, 1000];
 const earthRadiusKm = 6378.137;
-const coastlines: Array<Array<[number, number]>> = [
-  [[72, -168], [69, -142], [60, -130], [54, -126], [48, -124], [34, -118], [24, -110], [18, -103], [9, -83], [19, -81], [26, -97], [30, -90], [30, -82], [39, -74], [47, -67], [54, -60], [62, -71], [72, -85], [75, -105], [72, -128], [72, -168]],
-  [[13, -81], [7, -77], [-5, -81], [-18, -71], [-34, -71], [-55, -68], [-50, -58], [-34, -52], [-18, -39], [-5, -35], [7, -50], [12, -62], [13, -81]],
-  [[36, -10], [43, -9], [48, -5], [52, 3], [58, 10], [71, 27], [69, 42], [61, 35], [55, 44], [59, 60], [72, 105], [72, 140], [60, 164], [51, 156], [43, 142], [35, 129], [24, 121], [20, 109], [10, 105], [1, 104], [7, 94], [22, 89], [24, 68], [29, 48], [39, 36], [36, 22], [41, 15], [36, -10]],
-  [[36, -17], [31, -10], [15, -17], [5, -6], [-5, 10], [-17, 12], [-35, 18], [-35, 27], [-26, 34], [-12, 40], [11, 51], [20, 38], [30, 32], [36, 12], [36, -17]],
-  [[-11, 112], [-22, 114], [-35, 117], [-39, 145], [-28, 154], [-16, 147], [-11, 132], [-11, 112]],
-  [[60, -52], [69, -50], [78, -39], [82, -20], [75, -17], [64, -41], [60, -52]],
-  [[-63, -180], [-70, -120], [-66, -60], [-72, 0], [-66, 60], [-70, 120], [-63, 180]],
-  [[45, 141], [42, 143], [39, 141], [35, 139], [33, 131], [36, 129]],
+type WorldTopology = Topology<{ countries: GeometryCollection; land: GeometryCollection }>;
+
+function worldLayers(source: unknown) {
+  const topology = source as WorldTopology;
+  return {
+    land: feature(topology, topology.objects.land),
+    coastline: mesh(topology, topology.objects.land),
+    borders: mesh(topology, topology.objects.countries, (left, right) => left !== right),
+  };
+}
+
+const world110 = worldLayers(world110Source);
+const worldGraticule = geoGraticule10();
+const continentLabels = [
+  { label: "NORTH AMERICA", lat: 45, lon: -108 },
+  { label: "SOUTH AMERICA", lat: -18, lon: -60 },
+  { label: "EUROPE", lat: 52, lon: 18 },
+  { label: "AFRICA", lat: 4, lon: 21 },
+  { label: "ASIA", lat: 43, lon: 88 },
+  { label: "OCEANIA", lat: -25, lon: 134 },
+  { label: "ANTARCTICA", lat: -77, lon: 10 },
 ];
 
 function classify(name: string): Exclude<Category, "all"> {
@@ -871,6 +888,7 @@ function OrbitCanvasGpu({
 }) {
   const [canvasFallback, setCanvasFallback] = useState(false);
   const [frameSource, setFrameSource] = useState<"connecting" | "server" | "browser">("connecting");
+  const [motionFps, setMotionFps] = useState(0);
   const earthCanvasRef = useRef<HTMLCanvasElement>(null);
   const glCanvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -957,6 +975,27 @@ function OrbitCanvasGpu({
     let lastColorSignature = "";
     let selectedTrail: GeoPosition[] = [];
     let trailKey = "";
+    let mapCache: null | { key: string; land: Path2D; coastline: Path2D; borders: Path2D; graticule: Path2D } = null;
+    let detailedWorld: ReturnType<typeof worldLayers> | null = null;
+    let mapDataCancelled = false;
+    let lastMapBuild = 0;
+    let lowDetailUntil = 0;
+    let fpsWindowStarted = performance.now();
+    let fpsFrames = 0;
+
+    void fetch(world50Url)
+      .then((response) => {
+        if (!response.ok) throw new Error("Detailed world map unavailable");
+        return response.json() as Promise<unknown>;
+      })
+      .then((source) => {
+        if (mapDataCancelled) return;
+        detailedWorld = worldLayers(source);
+        mapCache = null;
+      })
+      .catch(() => {
+        detailedWorld = null;
+      });
 
     gl.bindVertexArray(vao);
     const bindAttribute = (name: string, size: number, buffer: WebGLBuffer) => {
@@ -1056,6 +1095,42 @@ function OrbitCanvasGpu({
       return { width, height, ratio };
     };
 
+    const mapPathsFor = (timestamp: number, centerX: number, centerY: number, radius: number) => {
+      const lowDetail = pointerRef.current.active || timestamp < lowDetailUntil || !detailedWorld;
+      const detail = lowDetail ? "110m" : "50m";
+      const longitude = 90 - cameraRef.current.yaw * 180 / Math.PI;
+      const latitude = cameraRef.current.pitch * 180 / Math.PI;
+      const key = [
+        detail,
+        Math.round(centerX),
+        Math.round(centerY),
+        Math.round(radius * 2) / 2,
+        Math.round(longitude * 4) / 4,
+        Math.round(latitude * 4) / 4,
+      ].join(":");
+      if (mapCache?.key === key) return mapCache;
+      if (lowDetail && mapCache && timestamp - lastMapBuild < 190) return mapCache;
+
+      const layers = lowDetail ? world110 : detailedWorld;
+      const projection = geoOrthographic()
+        .translate([centerX, centerY])
+        .scale(radius)
+        .rotate([-longitude, -latitude])
+        .reflectX(true)
+        .clipAngle(90)
+        .precision(lowDetail ? 0.55 : 0.28);
+      const path = geoPath(projection);
+      mapCache = {
+        key,
+        land: new Path2D(path(layers.land) ?? ""),
+        coastline: new Path2D(path(layers.coastline) ?? ""),
+        borders: new Path2D(path(layers.borders) ?? ""),
+        graticule: new Path2D(path(worldGraticule) ?? ""),
+      };
+      lastMapBuild = timestamp;
+      return mapCache;
+    };
+
     const drawEarth = (timestamp: number, at: number, width: number, height: number, ratio: number) => {
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.clearRect(0, 0, width, height);
@@ -1088,35 +1163,44 @@ function OrbitCanvasGpu({
       context.beginPath();
       context.arc(centerX, centerY, radius - 1, 0, Math.PI * 2);
       context.clip();
+      const mapPaths = mapPathsFor(timestamp, centerX, centerY, radius);
       context.strokeStyle = "rgba(110, 227, 213, .17)";
       context.lineWidth = 0.7;
-      const drawGeoLine = (points: Array<{ lat: number; lon: number }>) => {
-        let penDown = false;
-        context.beginPath();
-        points.forEach((point) => {
-          const rotated = rotateGeo(point.lat, point.lon, 1.002);
-          const screen = project(rotated);
-          if (rotated.z <= 0) {
-            penDown = false;
-            return;
-          }
-          if (penDown) context.lineTo(screen.x, screen.y);
-          else context.moveTo(screen.x, screen.y);
-          penDown = true;
-        });
-        context.stroke();
-      };
-      for (let lat = -60; lat <= 60; lat += 30) drawGeoLine(Array.from({ length: 73 }, (_, index) => ({ lat, lon: -180 + index * 5 })));
-      for (let lon = -150; lon <= 180; lon += 30) drawGeoLine(Array.from({ length: 37 }, (_, index) => ({ lat: -90 + index * 5, lon })));
-      context.strokeStyle = "rgba(157, 236, 218, .52)";
-      context.lineWidth = 1.15;
-      coastlines.forEach((coastline) => drawGeoLine(coastline.map(([lat, lon]) => ({ lat, lon }))));
+      context.stroke(mapPaths.graticule);
+      const land = context.createLinearGradient(centerX - radius, centerY - radius, centerX + radius, centerY + radius);
+      land.addColorStop(0, "rgba(72, 132, 114, .96)");
+      land.addColorStop(0.5, "rgba(31, 90, 82, .94)");
+      land.addColorStop(1, "rgba(12, 48, 55, .94)");
+      context.fillStyle = land;
+      context.fill(mapPaths.land);
+      context.strokeStyle = "rgba(205, 255, 220, .72)";
+      context.lineWidth = 1.05;
+      context.stroke(mapPaths.coastline);
+      context.strokeStyle = "rgba(173, 239, 215, .27)";
+      context.lineWidth = 0.55;
+      context.stroke(mapPaths.borders);
       const shade = context.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
       shade.addColorStop(0, "rgba(0, 2, 6, .02)");
       shade.addColorStop(0.6, "rgba(0, 2, 6, .14)");
       shade.addColorStop(1, "rgba(0, 2, 6, .85)");
       context.fillStyle = shade;
       context.fillRect(centerX - radius, centerY - radius, radius * 2, radius * 2);
+      context.restore();
+
+      context.save();
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.font = "600 7px ui-monospace, SFMono-Regular, Menlo, monospace";
+      continentLabels.forEach((item) => {
+        const rotated = rotateGeo(item.lat, item.lon, 1.004);
+        if (rotated.z < 0.34) return;
+        const screen = project(rotated);
+        const labelWidth = context.measureText(item.label).width + 9;
+        context.fillStyle = "rgba(3, 13, 17, .56)";
+        context.fillRect(screen.x - labelWidth / 2, screen.y - 6, labelWidth, 12);
+        context.fillStyle = "rgba(202, 243, 220, .68)";
+        context.fillText(item.label, screen.x, screen.y + 0.5);
+      });
       context.restore();
 
       if (selectedTrail.length > 1) {
@@ -1343,6 +1427,12 @@ function OrbitCanvasGpu({
       animationFrame = requestAnimationFrame(draw);
       if (hidden || (reducedMotion && timestamp - lastReducedFrame < 100)) return;
       lastReducedFrame = timestamp;
+      fpsFrames += 1;
+      if (timestamp - fpsWindowStarted >= 1000) {
+        setMotionFps(Math.round(fpsFrames * 1000 / (timestamp - fpsWindowStarted)));
+        fpsFrames = 0;
+        fpsWindowStarted = timestamp;
+      }
       const at = simulationMs();
       const nextTrailKey = `${selectedIdRef.current ?? "none"}-${Math.floor(at / 600000)}`;
       if (nextTrailKey !== trailKey) {
@@ -1369,6 +1459,7 @@ function OrbitCanvasGpu({
       if (Math.hypot(dx, dy) > 5) pointerRef.current.moved = true;
       cameraRef.current.yaw = pointerRef.current.yaw + dx * 0.006;
       cameraRef.current.pitch = Math.max(-1.15, Math.min(1.15, pointerRef.current.pitch + dy * 0.005));
+      lowDetailUntil = performance.now() + 220;
     };
     const pointerUp = (event: PointerEvent) => {
       if (!pointerRef.current.moved) {
@@ -1399,6 +1490,7 @@ function OrbitCanvasGpu({
     const wheel = (event: WheelEvent) => {
       event.preventDefault();
       cameraRef.current.zoom = Math.max(0.72, Math.min(1.35, cameraRef.current.zoom - event.deltaY * 0.0005));
+      lowDetailUntil = performance.now() + 220;
     };
     const visibilityChange = () => {
       hidden = document.visibilityState === "hidden";
@@ -1416,6 +1508,7 @@ function OrbitCanvasGpu({
 
     return () => {
       cancelAnimationFrame(animationFrame);
+      mapDataCancelled = true;
       window.clearInterval(serverTimer);
       abortController.abort();
       if (refreshFrameRef.current) refreshFrameRef.current = null;
@@ -1447,7 +1540,10 @@ function OrbitCanvasGpu({
     <div className="orbit-renderer" role="img" aria-label={messages[locale]["globe.aria"]}>
       <canvas ref={earthCanvasRef} className="earth-canvas" aria-hidden="true" />
       <canvas ref={glCanvasRef} className="satellite-gl" aria-hidden="true" />
-      <div className={`frame-source frame-source--${frameSource}`}>{frameSource === "server" ? "EDGE ORBIT FRAME" : frameSource === "browser" ? "BROWSER BACKUP" : "SYNCING ORBITS"}</div>
+      <div className={`frame-source frame-source--${frameSource}`}>
+        {frameSource === "server" ? "EDGE ORBIT FRAME" : frameSource === "browser" ? "BROWSER BACKUP" : "SYNCING ORBITS"}
+        <b>{motionFps > 0 ? `${motionFps} FPS` : "MOTION SYNC"}</b>
+      </div>
     </div>
   );
 }

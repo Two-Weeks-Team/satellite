@@ -771,10 +771,12 @@ a {
 }
 
 .frame-source {
+  align-items: center;
   background: rgba(4, 9, 12, 0.72);
   border: 1px solid rgba(105, 233, 237, 0.16);
   bottom: 15px;
   color: var(--muted);
+  display: flex;
   font-family: var(--mono);
   font-size: 6px;
   letter-spacing: 0.1em;
@@ -782,7 +784,15 @@ a {
   pointer-events: none;
   position: absolute;
   right: 15px;
+  gap: 7px;
   z-index: 3;
+}
+
+.frame-source b {
+  border-left: 1px solid currentColor;
+  color: rgba(224, 249, 242, 0.74);
+  font-weight: 600;
+  padding-left: 7px;
 }
 
 .frame-source--server { color: var(--cyan); }
