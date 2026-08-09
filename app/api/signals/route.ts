@@ -14,6 +14,8 @@ const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
 const TWO_HOURS = 60 * 60 * 2;
+const FAILURE_CACHE_SECONDS = 30;
+const SOURCE_TIMEOUT_MS = 4_000;
 
 function cleanHtml(value: string) {
   return value
@@ -83,23 +85,31 @@ function currentKp(rows: unknown) {
   };
 }
 
-async function cachedFetch(url: string, accept: string) {
-  return fetch(url, {
-    headers: { accept },
-    cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
-  } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+async function cachedFetchText(url: string, accept: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: { accept },
+      signal: controller.signal,
+      cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
+    } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+    if (!response.ok) throw new Error(`${new URL(url).hostname} ${response.status}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-export async function loadSignals() {
+async function cachedFetchJson<T>(url: string) {
+  return JSON.parse(await cachedFetchText(url, "application/json")) as T;
+}
+
+async function loadSignalsOnce() {
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
-    cachedFetch(SOCRATES, "text/html").then(async (response) => {
-      if (!response.ok) throw new Error(`SOCRATES ${response.status}`);
-      return parseConjunctions(await response.text());
-    }),
-    cachedFetch(DECAYING, "application/json").then(async (response) => {
-      if (!response.ok) throw new Error(`Decays ${response.status}`);
-      const data = await response.json() as Array<Record<string, string | number>>;
+    cachedFetchText(SOCRATES, "text/html").then(parseConjunctions),
+    cachedFetchJson<Array<Record<string, string | number>>>(DECAYING).then((data) => {
       return data.slice(0, 20).map((item) => ({
         id: Number(item.NORAD_CAT_ID),
         name: String(item.OBJECT_NAME),
@@ -108,10 +118,7 @@ export async function loadSignals() {
         bstar: Number(item.BSTAR),
       }));
     }),
-    cachedFetch(KP, "application/json").then(async (response) => {
-      if (!response.ok) throw new Error(`NOAA ${response.status}`);
-      return currentKp(await response.json());
-    }),
+    cachedFetchJson<unknown>(KP).then(currentKp),
   ]);
 
   const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
@@ -133,6 +140,32 @@ export async function loadSignals() {
   };
 }
 
+type SignalsResult = Awaited<ReturnType<typeof loadSignalsOnce>>;
+let signalsCache: SignalsResult | null = null;
+let signalsPromise: Promise<SignalsResult> | null = null;
+
+function signalsCacheIsFresh(signals: SignalsResult) {
+  const age = Date.now() - Date.parse(signals.fetchedAt);
+  const maxAge = (signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS) * 1000;
+  return Number.isFinite(age) && age >= 0 && age < maxAge;
+}
+
+export async function loadSignals() {
+  if (signalsCache && signalsCacheIsFresh(signalsCache)) return signalsCache;
+  if (signalsPromise) return signalsPromise;
+  signalsPromise = loadSignalsOnce()
+    .then((signals) => {
+      signalsCache = signals;
+      return signals;
+    })
+    .finally(() => {
+      signalsPromise = null;
+    });
+  return signalsPromise;
+}
+
 export async function GET() {
-  return Response.json(await loadSignals(), { headers: { "Cache-Control": `public, s-maxage=${TWO_HOURS}, stale-while-revalidate=${TWO_HOURS}` } });
+  const signals = await loadSignals();
+  const cacheSeconds = signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS;
+  return Response.json(signals, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
 }
