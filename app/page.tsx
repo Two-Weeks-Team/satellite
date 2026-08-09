@@ -59,7 +59,8 @@ type SatelliteEntry = {
   meanMotion: number;
   bstar: number;
   category: Exclude<Category, "all">;
-  satrec: SatRec;
+  satrec?: SatRec;
+  omm: CompactOmm;
 };
 
 type GeoPosition = {
@@ -82,6 +83,25 @@ type MotionState = {
   sampleAt: number;
   correction: Vector3;
   correctionAt: number;
+};
+type OrbitSnapshot = {
+  startPositions: Float32Array;
+  endPositions: Float32Array;
+  correction: Float32Array;
+  startTime: number;
+  endTime: number;
+  receivedAt: number;
+  count: number;
+};
+
+type WorkerSnapshot = {
+  type: "snapshot";
+  generation: number;
+  startTime: number;
+  endTime: number;
+  computeMs: number;
+  startPositions: Float32Array;
+  endPositions: Float32Array;
 };
 
 const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
@@ -129,7 +149,9 @@ function tupleToOmm(tuple: CompactOmm): OMMJsonObject {
 }
 
 function propagateEntry(entry: SatelliteEntry, date: Date): GeoPosition | null {
-  const result = propagate(entry.satrec, date);
+  const satrec = satrecFor(entry);
+  if (!satrec) return null;
+  const result = propagate(satrec, date);
   if (!result) return null;
   const geodetic = eciToGeodetic(result.position, gstime(date));
   return {
@@ -143,6 +165,16 @@ function propagateEntry(entry: SatelliteEntry, date: Date): GeoPosition | null {
   };
 }
 
+function satrecFor(entry: SatelliteEntry) {
+  if (entry.satrec) return entry.satrec;
+  try {
+    entry.satrec = json2satrec(tupleToOmm(entry.omm));
+    return entry.satrec;
+  } catch {
+    return null;
+  }
+}
+
 function formatNumber(value: number, locale: Locale, digits = 0) {
   return new Intl.NumberFormat(localeTags[locale], { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
 }
@@ -154,6 +186,112 @@ function relativeTime(dateInput: string | Date, now: Date, locale: Locale) {
   if (Math.abs(minutes) < 60) return formatter.format(minutes, "minute");
   if (Math.abs(minutes) < 1440) return formatter.format(Math.round(minutes / 60), "hour");
   return new Intl.DateTimeFormat(localeTags[locale], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function categoryCode(category: SatelliteEntry["category"]) {
+  return { station: 0, starlink: 1, weather: 2, navigation: 3, science: 4, other: 5 }[category];
+}
+
+function compileShader(gl: WebGL2RenderingContext, type: number, source: string) {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.warn("Orbit shader compile failed", gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
+}
+
+function createOrbitProgram(gl: WebGL2RenderingContext) {
+  const vertex = compileShader(gl, gl.VERTEX_SHADER, `#version 300 es
+    precision highp float;
+    in vec3 aStart;
+    in vec3 aEnd;
+    in vec3 aCorrection;
+    in float aCategory;
+    in float aSelected;
+    uniform float uProgress;
+    uniform float uCorrectionWeight;
+    uniform float uYaw;
+    uniform float uPitch;
+    uniform float uDisplayScale;
+    uniform float uPixelRatio;
+    uniform vec2 uProjectionScale;
+    out float vCategory;
+    out float vSelected;
+    out float vAlpha;
+
+    void main() {
+      vec3 ecf = mix(aStart, aEnd, uProgress) + aCorrection * uCorrectionWeight;
+      float radiusKm = length(ecf);
+      float altitude = max(0.0, radiusKm - 6378.137);
+      float radial = 1.0 + min(0.82, log(1.0 + altitude / 350.0) * 0.17);
+      vec3 point = vec3(ecf.x, ecf.z, ecf.y) / max(radiusKm, 1.0) * radial;
+      float cy = cos(uYaw);
+      float sy = sin(uYaw);
+      float cp = cos(uPitch);
+      float sp = sin(uPitch);
+      float x1 = point.x * cy - point.z * sy;
+      float z1 = point.x * sy + point.z * cy;
+      float y2 = point.y * cp - z1 * sp;
+      float z2 = point.y * sp + z1 * cp;
+      vec2 projected = vec2(x1 * uProjectionScale.x, y2 * uProjectionScale.y);
+      gl_Position = vec4(projected.x, projected.y + 0.02, 0.0, 1.0);
+      float normalSize = 1.35 + log2(max(2.0, uDisplayScale)) * 0.58;
+      gl_PointSize = (aSelected > 0.5 ? normalSize + 7.0 : normalSize) * uPixelRatio;
+      bool earthOccluded = z2 < 0.0 && length(vec2(x1, y2)) < 1.01;
+      vAlpha = earthOccluded ? 0.0 : (z2 < 0.0 ? 0.18 : 1.0);
+      vCategory = aCategory;
+      vSelected = aSelected;
+    }
+  `);
+  const fragment = compileShader(gl, gl.FRAGMENT_SHADER, `#version 300 es
+    precision highp float;
+    in float vCategory;
+    in float vSelected;
+    in float vAlpha;
+    out vec4 outColor;
+
+    vec3 categoryColor(float category) {
+      if (category < 0.5) return vec3(0.757, 1.0, 0.447);
+      if (category < 1.5) return vec3(0.447, 0.659, 1.0);
+      if (category < 2.5) return vec3(0.38, 0.914, 0.929);
+      if (category < 3.5) return vec3(0.765, 0.584, 1.0);
+      if (category < 4.5) return vec3(1.0, 0.839, 0.42);
+      return vec3(0.667, 0.725, 0.745);
+    }
+
+    void main() {
+      if (vAlpha <= 0.0) discard;
+      float distanceFromCenter = length(gl_PointCoord - vec2(0.5)) * 2.0;
+      if (distanceFromCenter > 1.0) discard;
+      vec3 color = categoryColor(vCategory);
+      float edge = 1.0 - smoothstep(0.72, 1.0, distanceFromCenter);
+      if (vSelected > 0.5 && distanceFromCenter > 0.56) {
+        outColor = vec4(color, vAlpha * smoothstep(1.0, 0.76, distanceFromCenter));
+      } else {
+        float glow = vSelected > 0.5 ? 1.0 : 0.78 + edge * 0.22;
+        outColor = vec4(color * glow, vAlpha * edge);
+      }
+    }
+  `);
+  if (!vertex || !fragment) return null;
+  const program = gl.createProgram();
+  if (!program) return null;
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  gl.deleteShader(vertex);
+  gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.warn("Orbit shader link failed", gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return null;
+  }
+  return program;
 }
 
 function geoToVector(position: GeoPosition): Vector3 {
@@ -192,8 +330,7 @@ function scaleVector(vector: Vector3, amount: number): Vector3 {
 function renderedVector(state: MotionState, simulationMs: number, wallTimestamp: number): Vector3 {
   const predicted = addVector(state.vector, scaleVector(state.velocity, simulationMs - state.sampleAt));
   const progress = Math.max(0, Math.min(1, (wallTimestamp - state.correctionAt) / 1200));
-  const correctionWeight = (1 - progress) ** 3;
-  return addVector(predicted, scaleVector(state.correction, correctionWeight));
+  return addVector(predicted, scaleVector(state.correction, (1 - progress) ** 3));
 }
 
 function sampleEntries(entries: SatelliteEntry[], maximum: number) {
@@ -203,6 +340,8 @@ function sampleEntries(entries: SatelliteEntry[], maximum: number) {
 }
 
 function findNextPass(entry: SatelliteEntry, observer: Observer, start: Date): PassPrediction | null {
+  const satrec = satrecFor(entry);
+  if (!satrec) return null;
   const observerGd = {
     latitude: degreesToRadians(observer.lat),
     longitude: degreesToRadians(observer.lon),
@@ -215,7 +354,7 @@ function findNextPass(entry: SatelliteEntry, observer: Observer, start: Date): P
 
   for (let step = 0; step <= 240; step += 1) {
     const time = new Date(start.getTime() + step * 3 * 60000);
-    const result = propagate(entry.satrec, time);
+    const result = propagate(satrec, time);
     if (!result) continue;
     const look = ecfToLookAngles(observerGd, eciToEcf(result.position, gstime(time)));
     const elevation = look.elevation * 180 / Math.PI;
@@ -583,6 +722,487 @@ function OrbitCanvas({
   return <canvas ref={canvasRef} className="live-globe" role="img" aria-label={messages[locale]["globe.aria"]} />;
 }
 
+function OrbitCanvasGpu({
+  entries,
+  selectedId,
+  displayScale,
+  timeOffset,
+  pausedAt,
+  observer,
+  focusNonce,
+  focusPosition,
+  locale,
+  onSelect,
+}: {
+  entries: SatelliteEntry[];
+  selectedId: number | null;
+  displayScale: number;
+  timeOffset: number;
+  pausedAt: number | null;
+  observer: Observer;
+  focusNonce: number;
+  focusPosition: GeoPosition | null;
+  locale: Locale;
+  onSelect: (id: number) => void;
+}) {
+  const [canvasFallback, setCanvasFallback] = useState(false);
+  const earthCanvasRef = useRef<HTMLCanvasElement>(null);
+  const glCanvasRef = useRef<HTMLCanvasElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const snapshotRef = useRef<OrbitSnapshot | null>(null);
+  const cameraRef = useRef({ yaw: Math.PI / 2 - degreesToRadians(126.98), pitch: degreesToRadians(20), zoom: 1 });
+  const focusPositionRef = useRef(focusPosition);
+  const pointerRef = useRef({ active: false, moved: false, x: 0, y: 0, yaw: 0, pitch: 0 });
+  const hardResetRef = useRef(true);
+  const selectedIdRef = useRef(selectedId);
+  const displayScaleRef = useRef(displayScale);
+  const timeOffsetRef = useRef(timeOffset);
+  const pausedAtRef = useRef(pausedAt);
+  const observerRef = useRef(observer);
+  const onSelectRef = useRef(onSelect);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+    displayScaleRef.current = displayScale;
+    timeOffsetRef.current = timeOffset;
+    pausedAtRef.current = pausedAt;
+    observerRef.current = observer;
+    onSelectRef.current = onSelect;
+  }, [selectedId, displayScale, timeOffset, pausedAt, observer, onSelect]);
+
+  useEffect(() => {
+    focusPositionRef.current = focusPosition;
+  }, [focusPosition]);
+
+  useEffect(() => {
+    const position = focusPositionRef.current;
+    if (!position) return;
+    cameraRef.current.yaw = Math.PI / 2 - degreesToRadians(position.lon);
+    cameraRef.current.pitch = degreesToRadians(position.lat);
+  }, [focusNonce]);
+
+  useEffect(() => {
+    hardResetRef.current = true;
+    workerRef.current?.postMessage({ type: "control", offsetMs: timeOffset * 60000, pausedAt });
+  }, [timeOffset, pausedAt]);
+
+  useEffect(() => {
+    const earthCanvas = earthCanvasRef.current;
+    const glCanvas = glCanvasRef.current;
+    if (canvasFallback || !earthCanvas || !glCanvas) return;
+    const context = earthCanvas.getContext("2d");
+    const gl = glCanvas.getContext("webgl2", { alpha: true, antialias: false, depth: false, premultipliedAlpha: true });
+    if (!context || !gl) {
+      setCanvasFallback(true);
+      return;
+    }
+    const program = createOrbitProgram(gl);
+    if (!program) {
+      setCanvasFallback(true);
+      return;
+    }
+
+    const vao = gl.createVertexArray();
+    const startBuffer = gl.createBuffer();
+    const endBuffer = gl.createBuffer();
+    const correctionBuffer = gl.createBuffer();
+    const categoryBuffer = gl.createBuffer();
+    const selectedBuffer = gl.createBuffer();
+    if (!vao || !startBuffer || !endBuffer || !correctionBuffer || !categoryBuffer || !selectedBuffer) {
+      setCanvasFallback(true);
+      gl.deleteProgram(program);
+      return;
+    }
+
+    const selectedFlags = new Float32Array(entries.length);
+    const entryIndex = new Map(entries.map((entry, index) => [entry.id, index]));
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let hidden = document.visibilityState === "hidden";
+    let animationFrame = 0;
+    let lastReducedFrame = 0;
+    let lastSelectedId: number | null | undefined;
+    let selectedTrail: GeoPosition[] = [];
+    let trailKey = "";
+
+    gl.bindVertexArray(vao);
+    const bindAttribute = (name: string, size: number, buffer: WebGLBuffer) => {
+      const location = gl.getAttribLocation(program, name);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(location, 1);
+    };
+    bindAttribute("aStart", 3, startBuffer);
+    bindAttribute("aEnd", 3, endBuffer);
+    bindAttribute("aCorrection", 3, correctionBuffer);
+    bindAttribute("aCategory", 1, categoryBuffer);
+    bindAttribute("aSelected", 1, selectedBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, categoryBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, Float32Array.from(entries, (entry) => categoryCode(entry.category)), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, selectedBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, selectedFlags, gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(null);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    const simulationMs = () => (pausedAtRef.current ?? Date.now()) + timeOffsetRef.current * 60000;
+
+    const rotateGeo = (lat: number, lon: number, radial = 1) => {
+      const latitude = degreesToRadians(lat);
+      const longitude = degreesToRadians(lon);
+      const x = Math.cos(latitude) * Math.cos(longitude) * radial;
+      const y = Math.sin(latitude) * radial;
+      const z = Math.cos(latitude) * Math.sin(longitude) * radial;
+      const { yaw, pitch } = cameraRef.current;
+      const x1 = x * Math.cos(yaw) - z * Math.sin(yaw);
+      const z1 = x * Math.sin(yaw) + z * Math.cos(yaw);
+      return {
+        x: x1,
+        y: y * Math.cos(pitch) - z1 * Math.sin(pitch),
+        z: y * Math.sin(pitch) + z1 * Math.cos(pitch),
+      };
+    };
+
+    const pointFromSnapshot = (index: number, at: number, timestamp: number) => {
+      const snapshot = snapshotRef.current;
+      if (!snapshot || index < 0 || index >= snapshot.count) return null;
+      const span = snapshot.endTime - snapshot.startTime;
+      const progress = span > 0 ? Math.max(0, Math.min(1.5, (at - snapshot.startTime) / span)) : 0;
+      const ease = Math.max(0, Math.min(1, (timestamp - snapshot.receivedAt) / 1200));
+      const correctionWeight = (1 - ease) ** 3;
+      const offset = index * 3;
+      const x = snapshot.startPositions[offset] + (snapshot.endPositions[offset] - snapshot.startPositions[offset]) * progress + snapshot.correction[offset] * correctionWeight;
+      const y = snapshot.startPositions[offset + 1] + (snapshot.endPositions[offset + 1] - snapshot.startPositions[offset + 1]) * progress + snapshot.correction[offset + 1] * correctionWeight;
+      const z = snapshot.startPositions[offset + 2] + (snapshot.endPositions[offset + 2] - snapshot.startPositions[offset + 2]) * progress + snapshot.correction[offset + 2] * correctionWeight;
+      const radiusKm = Math.hypot(x, y, z);
+      if (!Number.isFinite(radiusKm) || radiusKm < 1) return null;
+      const radial = 1 + Math.min(0.82, Math.log1p(Math.max(0, radiusKm - earthRadiusKm) / 350) * 0.17);
+      const pointX = x / radiusKm * radial;
+      const pointY = z / radiusKm * radial;
+      const pointZ = y / radiusKm * radial;
+      const { yaw, pitch } = cameraRef.current;
+      const x1 = pointX * Math.cos(yaw) - pointZ * Math.sin(yaw);
+      const z1 = pointX * Math.sin(yaw) + pointZ * Math.cos(yaw);
+      return {
+        x: x1,
+        y: pointY * Math.cos(pitch) - z1 * Math.sin(pitch),
+        z: pointY * Math.sin(pitch) + z1 * Math.cos(pitch),
+      };
+    };
+
+    const resize = () => {
+      const bounds = earthCanvas.getBoundingClientRect();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, bounds.width);
+      const height = Math.max(1, bounds.height);
+      const pixelWidth = Math.round(width * ratio);
+      const pixelHeight = Math.round(height * ratio);
+      if (earthCanvas.width !== pixelWidth || earthCanvas.height !== pixelHeight) {
+        earthCanvas.width = pixelWidth;
+        earthCanvas.height = pixelHeight;
+      }
+      if (glCanvas.width !== pixelWidth || glCanvas.height !== pixelHeight) {
+        glCanvas.width = pixelWidth;
+        glCanvas.height = pixelHeight;
+      }
+      return { width, height, ratio };
+    };
+
+    const drawEarth = (timestamp: number, at: number, width: number, height: number, ratio: number) => {
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width, height);
+      const centerX = width * 0.5;
+      const centerY = height * 0.49;
+      const radius = Math.min(width, height) * 0.31 * cameraRef.current.zoom;
+      const project = (point: { x: number; y: number; z: number }) => ({ x: centerX + point.x * radius, y: centerY - point.y * radius, z: point.z });
+
+      const sky = context.createRadialGradient(centerX, centerY, radius * 0.4, centerX, centerY, radius * 2.8);
+      sky.addColorStop(0, "rgba(20, 117, 121, .15)");
+      sky.addColorStop(0.45, "rgba(10, 45, 62, .08)");
+      sky.addColorStop(1, "rgba(3, 6, 9, 0)");
+      context.fillStyle = sky;
+      context.fillRect(0, 0, width, height);
+
+      const earth = context.createRadialGradient(centerX - radius * 0.42, centerY - radius * 0.5, radius * 0.08, centerX, centerY, radius * 1.08);
+      earth.addColorStop(0, "#2a7283");
+      earth.addColorStop(0.38, "#164b5e");
+      earth.addColorStop(0.72, "#0a2838");
+      earth.addColorStop(1, "#02070b");
+      context.beginPath();
+      context.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      context.fillStyle = earth;
+      context.fill();
+      context.strokeStyle = "rgba(107, 238, 218, .46)";
+      context.lineWidth = 1.2;
+      context.stroke();
+
+      context.save();
+      context.beginPath();
+      context.arc(centerX, centerY, radius - 1, 0, Math.PI * 2);
+      context.clip();
+      context.strokeStyle = "rgba(110, 227, 213, .17)";
+      context.lineWidth = 0.7;
+      const drawGeoLine = (points: Array<{ lat: number; lon: number }>) => {
+        let penDown = false;
+        context.beginPath();
+        points.forEach((point) => {
+          const rotated = rotateGeo(point.lat, point.lon, 1.002);
+          const screen = project(rotated);
+          if (rotated.z <= 0) {
+            penDown = false;
+            return;
+          }
+          if (penDown) context.lineTo(screen.x, screen.y);
+          else context.moveTo(screen.x, screen.y);
+          penDown = true;
+        });
+        context.stroke();
+      };
+      for (let lat = -60; lat <= 60; lat += 30) drawGeoLine(Array.from({ length: 73 }, (_, index) => ({ lat, lon: -180 + index * 5 })));
+      for (let lon = -150; lon <= 180; lon += 30) drawGeoLine(Array.from({ length: 37 }, (_, index) => ({ lat: -90 + index * 5, lon })));
+      const shade = context.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
+      shade.addColorStop(0, "rgba(0, 2, 6, .02)");
+      shade.addColorStop(0.6, "rgba(0, 2, 6, .14)");
+      shade.addColorStop(1, "rgba(0, 2, 6, .85)");
+      context.fillStyle = shade;
+      context.fillRect(centerX - radius, centerY - radius, radius * 2, radius * 2);
+      context.restore();
+
+      if (selectedTrail.length > 1) {
+        context.beginPath();
+        let penDown = false;
+        selectedTrail.forEach((position) => {
+          const radial = 1 + Math.min(0.82, Math.log1p(Math.max(0, position.altitude) / 350) * 0.17);
+          const rotated = rotateGeo(position.lat, position.lon, radial);
+          const screen = project(rotated);
+          if (rotated.z < 0 && Math.hypot(rotated.x, rotated.y) < 1) {
+            penDown = false;
+            return;
+          }
+          if (penDown) context.lineTo(screen.x, screen.y);
+          else context.moveTo(screen.x, screen.y);
+          penDown = true;
+        });
+        context.strokeStyle = "rgba(193, 255, 114, .56)";
+        context.lineWidth = 1.25;
+        context.stroke();
+      }
+
+      const currentObserver = observerRef.current;
+      const observerPoint = rotateGeo(currentObserver.lat, currentObserver.lon, 1.006);
+      if (observerPoint.z > 0) {
+        const screen = project(observerPoint);
+        context.beginPath();
+        context.arc(screen.x, screen.y, 3.2, 0, Math.PI * 2);
+        context.fillStyle = "#ffcf72";
+        context.shadowColor = "#ffcf72";
+        context.shadowBlur = 14;
+        context.fill();
+        context.shadowBlur = 0;
+      }
+
+      const selectedIndex = selectedIdRef.current === null ? undefined : entryIndex.get(selectedIdRef.current);
+      const selectedPoint = selectedIndex === undefined ? null : pointFromSnapshot(selectedIndex, at, timestamp);
+      if (selectedPoint && selectedPoint.z >= 0) {
+        const screen = project(selectedPoint);
+        const label = entries[selectedIndex!].name;
+        context.font = "600 10px ui-monospace, monospace";
+        const labelWidth = Math.min(180, context.measureText(label).width + 18);
+        const x = Math.min(width - labelWidth - 10, screen.x + 17);
+        const y = Math.max(24, screen.y - 14);
+        context.fillStyle = "rgba(5, 10, 14, .88)";
+        context.fillRect(x, y - 14, labelWidth, 25);
+        context.fillStyle = "#dfffc0";
+        context.fillText(label.slice(0, 24), x + 9, y + 3);
+      }
+    };
+
+    const drawWebGl = (timestamp: number, at: number, width: number, height: number, ratio: number) => {
+      gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      const snapshot = snapshotRef.current;
+      if (!snapshot) return;
+
+      if (lastSelectedId !== selectedIdRef.current) {
+        selectedFlags.fill(0);
+        const selectedIndex = selectedIdRef.current === null ? undefined : entryIndex.get(selectedIdRef.current);
+        if (selectedIndex !== undefined) selectedFlags[selectedIndex] = 1;
+        gl.bindBuffer(gl.ARRAY_BUFFER, selectedBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, selectedFlags);
+        lastSelectedId = selectedIdRef.current;
+      }
+
+      const span = snapshot.endTime - snapshot.startTime;
+      const progress = span > 0 ? Math.max(0, Math.min(1.5, (at - snapshot.startTime) / span)) : 0;
+      const ease = Math.max(0, Math.min(1, (timestamp - snapshot.receivedAt) / 1200));
+      const radius = Math.min(width, height) * 0.31 * cameraRef.current.zoom;
+      gl.useProgram(program);
+      gl.bindVertexArray(vao);
+      gl.uniform1f(gl.getUniformLocation(program, "uProgress"), progress);
+      gl.uniform1f(gl.getUniformLocation(program, "uCorrectionWeight"), (1 - ease) ** 3);
+      gl.uniform1f(gl.getUniformLocation(program, "uYaw"), cameraRef.current.yaw);
+      gl.uniform1f(gl.getUniformLocation(program, "uPitch"), cameraRef.current.pitch);
+      gl.uniform1f(gl.getUniformLocation(program, "uDisplayScale"), displayScaleRef.current);
+      gl.uniform1f(gl.getUniformLocation(program, "uPixelRatio"), ratio);
+      gl.uniform2f(gl.getUniformLocation(program, "uProjectionScale"), radius * 2 / width, radius * 2 / height);
+      gl.drawArraysInstanced(gl.POINTS, 0, 1, snapshot.count);
+      gl.bindVertexArray(null);
+    };
+
+    const uploadSnapshot = (message: WorkerSnapshot) => {
+      const count = message.startPositions.length / 3;
+      if (count !== entries.length || message.endPositions.length !== message.startPositions.length) return;
+      const prior = snapshotRef.current;
+      const correction = new Float32Array(message.startPositions.length);
+      if (!hardResetRef.current && prior && prior.count === count) {
+        const oldSpan = prior.endTime - prior.startTime;
+        const oldProgress = oldSpan > 0 ? Math.max(0, Math.min(1.5, (message.startTime - prior.startTime) / oldSpan)) : 0;
+        for (let index = 0; index < correction.length; index += 1) {
+          const predicted = prior.startPositions[index] + (prior.endPositions[index] - prior.startPositions[index]) * oldProgress;
+          const delta = predicted - message.startPositions[index];
+          correction[index] = Number.isFinite(delta) ? delta : 0;
+        }
+      }
+      hardResetRef.current = false;
+      snapshotRef.current = {
+        startPositions: message.startPositions,
+        endPositions: message.endPositions,
+        correction,
+        startTime: message.startTime,
+        endTime: message.endTime,
+        receivedAt: performance.now(),
+        count,
+      };
+      gl.bindBuffer(gl.ARRAY_BUFFER, startBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, message.startPositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, endBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, message.endPositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, correctionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, correction, gl.DYNAMIC_DRAW);
+    };
+
+    const worker = new Worker(new URL("./orbit.worker.ts", import.meta.url), { type: "module", name: "orbit-sgp4" });
+    workerRef.current = worker;
+    snapshotRef.current = null;
+    hardResetRef.current = true;
+    worker.onmessage = (event: MessageEvent<WorkerSnapshot>) => {
+      if (event.data.type === "snapshot") uploadSnapshot(event.data);
+    };
+    worker.postMessage({
+      type: "init",
+      entries: entries.map((entry) => entry.omm),
+      offsetMs: timeOffsetRef.current * 60000,
+      pausedAt: pausedAtRef.current,
+      active: !hidden,
+    });
+
+    const draw = (timestamp: number) => {
+      animationFrame = requestAnimationFrame(draw);
+      if (hidden || (reducedMotion && timestamp - lastReducedFrame < 100)) return;
+      lastReducedFrame = timestamp;
+      const at = simulationMs();
+      const nextTrailKey = `${selectedIdRef.current ?? "none"}-${Math.floor(at / 600000)}`;
+      if (nextTrailKey !== trailKey) {
+        trailKey = nextTrailKey;
+        const selectedIndex = selectedIdRef.current === null ? undefined : entryIndex.get(selectedIdRef.current);
+        const selected = selectedIndex === undefined ? null : entries[selectedIndex];
+        selectedTrail = selected
+          ? Array.from({ length: 49 }, (_, index) => propagateEntry(selected, new Date(at + (index - 16) * 3 * 60000))).filter((point): point is GeoPosition => point !== null)
+          : [];
+      }
+      const { width, height, ratio } = resize();
+      drawEarth(timestamp, at, width, height, ratio);
+      drawWebGl(timestamp, at, width, height, ratio);
+    };
+
+    const pointerDown = (event: PointerEvent) => {
+      glCanvas.setPointerCapture(event.pointerId);
+      pointerRef.current = { active: true, moved: false, x: event.clientX, y: event.clientY, yaw: cameraRef.current.yaw, pitch: cameraRef.current.pitch };
+    };
+    const pointerMove = (event: PointerEvent) => {
+      if (!pointerRef.current.active) return;
+      const dx = event.clientX - pointerRef.current.x;
+      const dy = event.clientY - pointerRef.current.y;
+      if (Math.hypot(dx, dy) > 5) pointerRef.current.moved = true;
+      cameraRef.current.yaw = pointerRef.current.yaw + dx * 0.006;
+      cameraRef.current.pitch = Math.max(-1.15, Math.min(1.15, pointerRef.current.pitch + dy * 0.005));
+    };
+    const pointerUp = (event: PointerEvent) => {
+      if (!pointerRef.current.moved) {
+        const bounds = glCanvas.getBoundingClientRect();
+        const x = event.clientX - bounds.left;
+        const y = event.clientY - bounds.top;
+        const centerX = bounds.width * 0.5;
+        const centerY = bounds.height * 0.49;
+        const radius = Math.min(bounds.width, bounds.height) * 0.31 * cameraRef.current.zoom;
+        const at = simulationMs();
+        const timestamp = performance.now();
+        const snapshot = snapshotRef.current;
+        let bestIndex = -1;
+        let bestDistance = 24;
+        for (let index = 0; snapshot && index < snapshot.count; index += 1) {
+          const point = pointFromSnapshot(index, at, timestamp);
+          if (!point || (point.z < 0 && Math.hypot(point.x, point.y) < 1.01)) continue;
+          const distance = Math.hypot(centerX + point.x * radius - x, centerY - point.y * radius - y);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = index;
+          }
+        }
+        if (bestIndex >= 0) onSelectRef.current(entries[bestIndex].id);
+      }
+      pointerRef.current.active = false;
+    };
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      cameraRef.current.zoom = Math.max(0.72, Math.min(1.35, cameraRef.current.zoom - event.deltaY * 0.0005));
+    };
+    const visibilityChange = () => {
+      hidden = document.visibilityState === "hidden";
+      worker.postMessage({ type: "visibility", active: !hidden });
+    };
+
+    glCanvas.addEventListener("pointerdown", pointerDown);
+    glCanvas.addEventListener("pointermove", pointerMove);
+    glCanvas.addEventListener("pointerup", pointerUp);
+    glCanvas.addEventListener("pointercancel", pointerUp);
+    glCanvas.addEventListener("wheel", wheel, { passive: false });
+    document.addEventListener("visibilitychange", visibilityChange);
+    animationFrame = requestAnimationFrame(draw);
+
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      worker.terminate();
+      if (workerRef.current === worker) workerRef.current = null;
+      glCanvas.removeEventListener("pointerdown", pointerDown);
+      glCanvas.removeEventListener("pointermove", pointerMove);
+      glCanvas.removeEventListener("pointerup", pointerUp);
+      glCanvas.removeEventListener("pointercancel", pointerUp);
+      glCanvas.removeEventListener("wheel", wheel);
+      document.removeEventListener("visibilitychange", visibilityChange);
+      gl.deleteBuffer(startBuffer);
+      gl.deleteBuffer(endBuffer);
+      gl.deleteBuffer(correctionBuffer);
+      gl.deleteBuffer(categoryBuffer);
+      gl.deleteBuffer(selectedBuffer);
+      gl.deleteVertexArray(vao);
+      gl.deleteProgram(program);
+    };
+  }, [canvasFallback, entries]);
+
+  if (canvasFallback) {
+    return <OrbitCanvas entries={sampleEntries(entries, 2400)} selectedId={selectedId} displayScale={displayScale} timeOffset={timeOffset} pausedAt={pausedAt} observer={observer} focusNonce={focusNonce} focusPosition={focusPosition} locale={locale} onSelect={onSelect} />;
+  }
+
+  return (
+    <div className="orbit-renderer" role="img" aria-label={messages[locale]["globe.aria"]}>
+      <canvas ref={earthCanvasRef} className="earth-canvas" aria-hidden="true" />
+      <canvas ref={glCanvasRef} className="satellite-gl" aria-hidden="true" />
+    </div>
+  );
+}
+
 function SatelliteIcon({ category }: { category: SatelliteEntry["category"] }) {
   return <span className={`sat-icon sat-icon--${category}`} aria-hidden="true"><i /><b /><i /></span>;
 }
@@ -670,23 +1290,17 @@ export default function Home() {
 
   const entries = useMemo(() => {
     if (!catalog) return [];
-    return catalog.items.flatMap((tuple) => {
-      try {
-        return [{
-          name: tuple[0],
-          id: tuple[1],
-          objectId: tuple[2],
-          epoch: tuple[3],
-          meanMotion: tuple[4],
-          inclination: tuple[6],
-          bstar: tuple[14],
-          category: classify(tuple[0]),
-          satrec: json2satrec(tupleToOmm(tuple)),
-        } satisfies SatelliteEntry];
-      } catch {
-        return [];
-      }
-    });
+    return catalog.items.map((tuple) => ({
+      name: tuple[0],
+      id: tuple[1],
+      objectId: tuple[2],
+      epoch: tuple[3],
+      meanMotion: tuple[4],
+      inclination: tuple[6],
+      bstar: tuple[14],
+      category: classify(tuple[0]),
+      omm: tuple,
+    } satisfies SatelliteEntry));
   }, [catalog]);
 
   useEffect(() => {
@@ -700,9 +1314,8 @@ export default function Home() {
   const categoryCounts = useMemo(() => Object.fromEntries(categoryMeta.map((category) => [category.id, category.id === "all" ? entries.length : entries.filter((entry) => entry.category === category.id).length])), [entries]);
   const filteredEntries = useMemo(() => filter === "all" ? entries : entries.filter((entry) => entry.category === filter), [entries, filter]);
   const renderEntries = useMemo(() => {
-    const sampled = sampleEntries(filteredEntries, 2400);
     const selected = entries.find((entry) => entry.id === selectedId);
-    return selected && !sampled.some((entry) => entry.id === selected.id) ? [...sampled, selected] : sampled;
+    return selected && !filteredEntries.some((entry) => entry.id === selected.id) ? [...filteredEntries, selected] : filteredEntries;
   }, [filteredEntries, entries, selectedId]);
 
   const selectedEntry = entries.find((entry) => entry.id === selectedId) ?? null;
@@ -790,10 +1403,10 @@ export default function Home() {
     : t["discover.connecting"];
   const trackingBody = selectedPosition
     ? locale === "ko"
-      ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. 화면은 두 최신 위치의 이동 벡터를 예측하고 다음 SGP4 값으로 부드럽게 보정합니다.`
+      ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. Worker가 전체 카탈로그의 SGP4 스냅샷을 계산하고 GPU가 프레임 사이를 보간한 뒤 새 값의 오차를 부드럽게 흡수합니다.`
       : locale === "ja"
-        ? `現在、高度${selectedPosition.altitude.toFixed(0)} kmを${selectedPosition.velocity.toFixed(2)} km/sで移動中です。直近2点の移動ベクトルでフレームを予測し、次のSGP4値へ滑らかに補正します。`
-        : `Moving at ${selectedPosition.velocity.toFixed(2)} km/s, ${selectedPosition.altitude.toFixed(0)} km above Earth. Frames extrapolate the two latest positions, then ease into the next SGP4 solution.`
+        ? `現在、高度${selectedPosition.altitude.toFixed(0)} kmを${selectedPosition.velocity.toFixed(2)} km/sで移動中です。Workerが全カタログのSGP4スナップショットを計算し、GPUがフレーム間を補間して新しい値との差を滑らかに吸収します。`
+        : `Moving at ${selectedPosition.velocity.toFixed(2)} km/s, ${selectedPosition.altitude.toFixed(0)} km above Earth. A Worker computes full-catalog SGP4 snapshots while the GPU interpolates every frame and smoothly absorbs each new solution.`
     : t["discover.loading"];
   const changeLanguage = (mode: LanguageMode) => {
     setLanguageMode(mode);
@@ -876,7 +1489,7 @@ export default function Home() {
           </aside>
 
           <div className="globe-stage">
-            <OrbitCanvas
+            <OrbitCanvasGpu
               entries={renderEntries}
               selectedId={selectedId}
               displayScale={displayScale}
