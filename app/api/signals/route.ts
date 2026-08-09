@@ -90,7 +90,7 @@ async function cachedFetch(url: string, accept: string) {
   } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
 }
 
-export async function GET() {
+export async function loadSignals() {
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
     cachedFetch(SOCRATES, "text/html").then(async (response) => {
@@ -119,19 +119,20 @@ export async function GET() {
   const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
   const liveSources = [conjunctions.length > 0, decays.length > 0, spaceWeather !== null].filter(Boolean).length;
 
-  return Response.json(
-    {
-      status: liveSources === 3 ? "live" : liveSources > 0 ? "partial" : "offline",
-      fetchedAt,
-      conjunctions,
-      decays,
-      spaceWeather,
-      sources: {
-        conjunctions: "CelesTrak SOCRATES Plus",
-        decays: "CelesTrak Potential Decays",
-        spaceWeather: "NOAA SWPC",
-      },
+  return {
+    status: liveSources === 3 ? "live" as const : liveSources > 0 ? "partial" as const : "offline" as const,
+    fetchedAt,
+    conjunctions,
+    decays,
+    spaceWeather,
+    sources: {
+      conjunctions: "CelesTrak SOCRATES Plus",
+      decays: "CelesTrak Potential Decays",
+      spaceWeather: "NOAA SWPC",
     },
-    { headers: { "Cache-Control": `public, s-maxage=${TWO_HOURS}, stale-while-revalidate=${TWO_HOURS}` } },
-  );
+  };
+}
+
+export async function GET() {
+  return Response.json(await loadSignals(), { headers: { "Cache-Control": `public, s-maxage=${TWO_HOURS}, stale-while-revalidate=${TWO_HOURS}` } });
 }

@@ -1,6 +1,6 @@
 type UpstreamOmm = Record<string, string | number | null>;
 
-type CompactOmm = [
+export type CompactOmm = [
   string,
   number,
   string,
@@ -123,25 +123,25 @@ async function fetchCatalog() {
   return items;
 }
 
-export async function GET() {
+export async function loadCatalog() {
   const fetchedAt = new Date().toISOString();
   try {
     const items = await fetchCatalog();
-    return Response.json(
-      { status: "live", source: "CelesTrak / USSF GP", fetchedAt, count: items.length, items },
-      { headers: { "Cache-Control": `public, s-maxage=${TWO_HOURS}, stale-while-revalidate=${TWO_HOURS}` } },
-    );
+    return { status: "live" as const, source: "CelesTrak / USSF GP", fetchedAt, count: items.length, items };
   } catch (error) {
-    return Response.json(
-      {
-        status: "cached-sample",
-        source: "CelesTrak last-known sample",
-        fetchedAt,
-        count: fallback.length,
-        items: fallback,
-        message: error instanceof Error ? error.message : "Live catalog unavailable",
-      },
-      { headers: { "Cache-Control": "public, s-maxage=300" } },
-    );
+    return {
+      status: "cached-sample" as const,
+      source: "CelesTrak last-known sample",
+      fetchedAt,
+      count: fallback.length,
+      items: fallback,
+      message: error instanceof Error ? error.message : "Live catalog unavailable",
+    };
   }
+}
+
+export async function GET() {
+  const catalog = await loadCatalog();
+  const cacheSeconds = catalog.status === "live" ? TWO_HOURS : 300;
+  return Response.json(catalog, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
 }

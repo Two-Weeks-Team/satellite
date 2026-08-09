@@ -19,6 +19,8 @@ import { detectLocale, localeFromCoordinates, localeTags, messages, type Languag
 type CompactOmm = [string, number, string, string, number, number, number, number, number, number, number, "U" | "C", number, number, number, number, number];
 type Category = "all" | "station" | "starlink" | "weather" | "navigation" | "science" | "other";
 type PanelTab = "discover" | "risk" | "sky";
+type ColorMode = "type" | "constellation" | "altitude" | "risk";
+type AutonomyMode = "manual" | "assist" | "autopilot";
 
 type CatalogResponse = {
   status: "live" | "cached-sample";
@@ -56,6 +58,7 @@ type SatelliteEntry = {
   objectId: string;
   epoch: string;
   inclination: number;
+  raan: number;
   meanMotion: number;
   bstar: number;
   category: Exclude<Category, "all">;
@@ -87,11 +90,14 @@ type MotionState = {
 type OrbitSnapshot = {
   startPositions: Float32Array;
   endPositions: Float32Array;
+  startVelocities: Float32Array;
+  endVelocities: Float32Array;
   correction: Float32Array;
   startTime: number;
   endTime: number;
   receivedAt: number;
   count: number;
+  source: "server" | "browser";
 };
 
 type WorkerSnapshot = {
@@ -102,6 +108,36 @@ type WorkerSnapshot = {
   computeMs: number;
   startPositions: Float32Array;
   endPositions: Float32Array;
+  startVelocities: Float32Array;
+  endVelocities: Float32Array;
+};
+
+type AgentEvent = {
+  id: string;
+  kind: "risk" | "discovery" | "sky" | "weather" | "decay";
+  agent: "SENTINEL" | "SCOUT" | "SKY";
+  priority: number;
+  title: Record<Locale, string>;
+  body: Record<Locale, string>;
+  confidence: number;
+  evidence: string[];
+  createdAt: string;
+  action: {
+    focusIds?: number[];
+    filter?: Exclude<Category, "other">;
+    colorMode?: ColorMode;
+    panel?: PanelTab;
+    timeAt?: string;
+  };
+};
+
+type AgentResponse = {
+  status: "active" | "degraded";
+  cycleStartedAt: string;
+  monitoredObjects: number;
+  evaluatedSignals: number;
+  agents: Array<{ id: string; state: string; detail: string }>;
+  events: AgentEvent[];
 };
 
 const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
@@ -115,6 +151,16 @@ const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
 
 const scaleStops = [2, 25, 100, 1000];
 const earthRadiusKm = 6378.137;
+const coastlines: Array<Array<[number, number]>> = [
+  [[72, -168], [69, -142], [60, -130], [54, -126], [48, -124], [34, -118], [24, -110], [18, -103], [9, -83], [19, -81], [26, -97], [30, -90], [30, -82], [39, -74], [47, -67], [54, -60], [62, -71], [72, -85], [75, -105], [72, -128], [72, -168]],
+  [[13, -81], [7, -77], [-5, -81], [-18, -71], [-34, -71], [-55, -68], [-50, -58], [-34, -52], [-18, -39], [-5, -35], [7, -50], [12, -62], [13, -81]],
+  [[36, -10], [43, -9], [48, -5], [52, 3], [58, 10], [71, 27], [69, 42], [61, 35], [55, 44], [59, 60], [72, 105], [72, 140], [60, 164], [51, 156], [43, 142], [35, 129], [24, 121], [20, 109], [10, 105], [1, 104], [7, 94], [22, 89], [24, 68], [29, 48], [39, 36], [36, 22], [41, 15], [36, -10]],
+  [[36, -17], [31, -10], [15, -17], [5, -6], [-5, 10], [-17, 12], [-35, 18], [-35, 27], [-26, 34], [-12, 40], [11, 51], [20, 38], [30, 32], [36, 12], [36, -17]],
+  [[-11, 112], [-22, 114], [-35, 117], [-39, 145], [-28, 154], [-16, 147], [-11, 132], [-11, 112]],
+  [[60, -52], [69, -50], [78, -39], [82, -20], [75, -17], [64, -41], [60, -52]],
+  [[-63, -180], [-70, -120], [-66, -60], [-72, 0], [-66, 60], [-70, 120], [-63, 180]],
+  [[45, 141], [42, 143], [39, 141], [35, 139], [33, 131], [36, 129]],
+];
 
 function classify(name: string): Exclude<Category, "all"> {
   const upper = name.toUpperCase();
@@ -188,8 +234,77 @@ function relativeTime(dateInput: string | Date, now: Date, locale: Locale) {
   return new Intl.DateTimeFormat(localeTags[locale], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
 }
 
-function categoryCode(category: SatelliteEntry["category"]) {
-  return { station: 0, starlink: 1, weather: 2, navigation: 3, science: 4, other: 5 }[category];
+function approximateAltitude(entry: SatelliteEntry) {
+  const radiansPerSecond = entry.meanMotion * Math.PI * 2 / 86400;
+  return Math.max(0, Math.cbrt(398600.4418 / (radiansPerSecond * radiansPerSecond)) - earthRadiusKm);
+}
+
+function satelliteColor(entry: SatelliteEntry, mode: ColorMode, riskIds: Set<number>): [number, number, number] {
+  if (mode === "risk") return riskIds.has(entry.id) ? [1, 0.34, 0.25] : [0.23, 0.34, 0.38];
+  if (mode === "altitude") {
+    const altitude = approximateAltitude(entry);
+    if (altitude < 1200) return [0.33, 0.89, 0.93];
+    if (altitude < 10000) return [0.45, 0.66, 1];
+    if (altitude < 30000) return [0.76, 0.58, 1];
+    return [1, 0.78, 0.35];
+  }
+  if (mode === "constellation" && entry.category === "starlink") {
+    const plane = Math.floor((((entry.raan % 360) + 360) % 360) / 30) % 6;
+    const shell = entry.inclination < 48 ? 0 : entry.inclination < 60 ? 1 : entry.inclination < 85 ? 2 : 3;
+    const palettes: Array<Array<[number, number, number]>> = [
+      [[0.24, 0.9, 0.8], [0.2, 0.76, 0.94], [0.34, 0.64, 1], [0.48, 0.55, 1], [0.57, 0.45, 0.95], [0.25, 0.82, 0.72]],
+      [[0.29, 0.66, 1], [0.4, 0.78, 1], [0.32, 0.55, 0.95], [0.46, 0.48, 1], [0.28, 0.82, 0.95], [0.52, 0.68, 1]],
+      [[0.72, 0.48, 1], [0.62, 0.54, 1], [0.82, 0.55, 0.93], [0.55, 0.68, 1], [0.76, 0.42, 0.86], [0.64, 0.62, 0.98]],
+      [[1, 0.48, 0.78], [0.9, 0.56, 1], [0.76, 0.62, 1], [1, 0.6, 0.66], [0.84, 0.48, 0.92], [0.72, 0.7, 1]],
+    ];
+    return palettes[shell][plane];
+  }
+  return {
+    station: [0.757, 1, 0.447],
+    starlink: [0.447, 0.659, 1],
+    weather: [0.38, 0.914, 0.929],
+    navigation: [0.765, 0.584, 1],
+    science: [1, 0.839, 0.42],
+    other: [0.667, 0.725, 0.745],
+  }[entry.category] as [number, number, number];
+}
+
+function parseServerFrame(buffer: ArrayBuffer, entries: SatelliteEntry[]): Omit<OrbitSnapshot, "correction" | "receivedAt"> {
+  const view = new DataView(buffer);
+  if (view.byteLength < 48 || view.getUint32(0, true) !== 0x5442524f || view.getUint16(4, true) !== 1) throw new Error("Invalid orbit frame");
+  const count = view.getUint32(8, true);
+  const headerBytes = view.getUint32(12, true);
+  const recordBytes = view.getUint32(44, true);
+  if (headerBytes + count * recordBytes > view.byteLength || recordBytes < 56) throw new Error("Truncated orbit frame");
+  if (count < entries.length * 0.9) throw new Error("Orbit frame catalog mismatch");
+  const indexById = new Map(entries.map((entry, index) => [entry.id, index]));
+  const startPositions = new Float32Array(entries.length * 3).fill(Number.NaN);
+  const endPositions = new Float32Array(entries.length * 3).fill(Number.NaN);
+  const startVelocities = new Float32Array(entries.length * 3);
+  const endVelocities = new Float32Array(entries.length * 3);
+  for (let record = 0; record < count; record += 1) {
+    const sourceOffset = headerBytes + record * recordBytes;
+    if (view.getUint8(sourceOffset + 4) !== 1) continue;
+    const targetIndex = indexById.get(view.getUint32(sourceOffset, true));
+    if (targetIndex === undefined) continue;
+    const targetOffset = targetIndex * 3;
+    for (let axis = 0; axis < 3; axis += 1) {
+      startPositions[targetOffset + axis] = view.getFloat32(sourceOffset + 8 + axis * 4, true);
+      startVelocities[targetOffset + axis] = view.getFloat32(sourceOffset + 20 + axis * 4, true);
+      endPositions[targetOffset + axis] = view.getFloat32(sourceOffset + 32 + axis * 4, true);
+      endVelocities[targetOffset + axis] = view.getFloat32(sourceOffset + 44 + axis * 4, true);
+    }
+  }
+  return {
+    startPositions,
+    endPositions,
+    startVelocities,
+    endVelocities,
+    startTime: view.getFloat64(16, true),
+    endTime: view.getFloat64(24, true),
+    count: entries.length,
+    source: "server",
+  };
 }
 
 function compileShader(gl: WebGL2RenderingContext, type: number, source: string) {
@@ -210,22 +325,34 @@ function createOrbitProgram(gl: WebGL2RenderingContext) {
     precision highp float;
     in vec3 aStart;
     in vec3 aEnd;
+    in vec3 aStartVelocity;
+    in vec3 aEndVelocity;
     in vec3 aCorrection;
-    in float aCategory;
+    in vec3 aColor;
     in float aSelected;
     uniform float uProgress;
+    uniform float uSpanSeconds;
     uniform float uCorrectionWeight;
     uniform float uYaw;
     uniform float uPitch;
     uniform float uDisplayScale;
     uniform float uPixelRatio;
+    uniform float uHasSelection;
+    uniform float uPulse;
     uniform vec2 uProjectionScale;
-    out float vCategory;
+    out vec3 vColor;
     out float vSelected;
     out float vAlpha;
 
     void main() {
-      vec3 ecf = mix(aStart, aEnd, uProgress) + aCorrection * uCorrectionWeight;
+      float t = clamp(uProgress, 0.0, 1.08);
+      float t2 = t * t;
+      float t3 = t2 * t;
+      float h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+      float h10 = t3 - 2.0 * t2 + t;
+      float h01 = -2.0 * t3 + 3.0 * t2;
+      float h11 = t3 - t2;
+      vec3 ecf = h00 * aStart + h10 * aStartVelocity * uSpanSeconds + h01 * aEnd + h11 * aEndVelocity * uSpanSeconds + aCorrection * uCorrectionWeight;
       float radiusKm = length(ecf);
       float altitude = max(0.0, radiusKm - 6378.137);
       float radial = 1.0 + min(0.82, log(1.0 + altitude / 350.0) * 0.17);
@@ -241,40 +368,33 @@ function createOrbitProgram(gl: WebGL2RenderingContext) {
       vec2 projected = vec2(x1 * uProjectionScale.x, y2 * uProjectionScale.y);
       gl_Position = vec4(projected.x, projected.y + 0.02, 0.0, 1.0);
       float normalSize = 1.35 + log2(max(2.0, uDisplayScale)) * 0.58;
-      gl_PointSize = (aSelected > 0.5 ? normalSize + 7.0 : normalSize) * uPixelRatio;
+      gl_PointSize = (aSelected > 0.5 ? normalSize + 7.0 + uPulse * 2.0 : normalSize) * uPixelRatio;
       bool earthOccluded = z2 < 0.0 && length(vec2(x1, y2)) < 1.01;
       vAlpha = earthOccluded ? 0.0 : (z2 < 0.0 ? 0.18 : 1.0);
-      vCategory = aCategory;
+      if (uHasSelection > 0.5 && aSelected < 0.5) vAlpha *= 0.38;
+      vColor = aColor;
       vSelected = aSelected;
     }
   `);
   const fragment = compileShader(gl, gl.FRAGMENT_SHADER, `#version 300 es
     precision highp float;
-    in float vCategory;
+    in vec3 vColor;
     in float vSelected;
     in float vAlpha;
     out vec4 outColor;
-
-    vec3 categoryColor(float category) {
-      if (category < 0.5) return vec3(0.757, 1.0, 0.447);
-      if (category < 1.5) return vec3(0.447, 0.659, 1.0);
-      if (category < 2.5) return vec3(0.38, 0.914, 0.929);
-      if (category < 3.5) return vec3(0.765, 0.584, 1.0);
-      if (category < 4.5) return vec3(1.0, 0.839, 0.42);
-      return vec3(0.667, 0.725, 0.745);
-    }
 
     void main() {
       if (vAlpha <= 0.0) discard;
       float distanceFromCenter = length(gl_PointCoord - vec2(0.5)) * 2.0;
       if (distanceFromCenter > 1.0) discard;
-      vec3 color = categoryColor(vCategory);
+      vec3 color = vColor;
       float edge = 1.0 - smoothstep(0.72, 1.0, distanceFromCenter);
       if (vSelected > 0.5 && distanceFromCenter > 0.56) {
-        outColor = vec4(color, vAlpha * smoothstep(1.0, 0.76, distanceFromCenter));
+        outColor = vec4(vec3(0.757, 1.0, 0.447), vAlpha * smoothstep(1.0, 0.76, distanceFromCenter));
       } else {
-        float glow = vSelected > 0.5 ? 1.0 : 0.78 + edge * 0.22;
-        outColor = vec4(color * glow, vAlpha * edge);
+        vec3 core = vSelected > 0.5 ? mix(color, vec3(1.0), 0.74) : color;
+        float glow = vSelected > 0.5 ? 1.18 : 0.78 + edge * 0.22;
+        outColor = vec4(core * glow, vAlpha * edge);
       }
     }
   `);
@@ -726,6 +846,8 @@ function OrbitCanvasGpu({
   entries,
   selectedId,
   displayScale,
+  colorMode,
+  riskIds,
   timeOffset,
   pausedAt,
   observer,
@@ -737,6 +859,8 @@ function OrbitCanvasGpu({
   entries: SatelliteEntry[];
   selectedId: number | null;
   displayScale: number;
+  colorMode: ColorMode;
+  riskIds: number[];
   timeOffset: number;
   pausedAt: number | null;
   observer: Observer;
@@ -746,6 +870,7 @@ function OrbitCanvasGpu({
   onSelect: (id: number) => void;
 }) {
   const [canvasFallback, setCanvasFallback] = useState(false);
+  const [frameSource, setFrameSource] = useState<"connecting" | "server" | "browser">("connecting");
   const earthCanvasRef = useRef<HTMLCanvasElement>(null);
   const glCanvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -754,8 +879,11 @@ function OrbitCanvasGpu({
   const focusPositionRef = useRef(focusPosition);
   const pointerRef = useRef({ active: false, moved: false, x: 0, y: 0, yaw: 0, pitch: 0 });
   const hardResetRef = useRef(true);
+  const refreshFrameRef = useRef<(() => void) | null>(null);
   const selectedIdRef = useRef(selectedId);
   const displayScaleRef = useRef(displayScale);
+  const colorModeRef = useRef(colorMode);
+  const riskIdsRef = useRef(riskIds);
   const timeOffsetRef = useRef(timeOffset);
   const pausedAtRef = useRef(pausedAt);
   const observerRef = useRef(observer);
@@ -764,11 +892,13 @@ function OrbitCanvasGpu({
   useEffect(() => {
     selectedIdRef.current = selectedId;
     displayScaleRef.current = displayScale;
+    colorModeRef.current = colorMode;
+    riskIdsRef.current = riskIds;
     timeOffsetRef.current = timeOffset;
     pausedAtRef.current = pausedAt;
     observerRef.current = observer;
     onSelectRef.current = onSelect;
-  }, [selectedId, displayScale, timeOffset, pausedAt, observer, onSelect]);
+  }, [selectedId, displayScale, colorMode, riskIds, timeOffset, pausedAt, observer, onSelect]);
 
   useEffect(() => {
     focusPositionRef.current = focusPosition;
@@ -784,6 +914,7 @@ function OrbitCanvasGpu({
   useEffect(() => {
     hardResetRef.current = true;
     workerRef.current?.postMessage({ type: "control", offsetMs: timeOffset * 60000, pausedAt });
+    refreshFrameRef.current?.();
   }, [timeOffset, pausedAt]);
 
   useEffect(() => {
@@ -805,10 +936,12 @@ function OrbitCanvasGpu({
     const vao = gl.createVertexArray();
     const startBuffer = gl.createBuffer();
     const endBuffer = gl.createBuffer();
+    const startVelocityBuffer = gl.createBuffer();
+    const endVelocityBuffer = gl.createBuffer();
     const correctionBuffer = gl.createBuffer();
-    const categoryBuffer = gl.createBuffer();
+    const colorBuffer = gl.createBuffer();
     const selectedBuffer = gl.createBuffer();
-    if (!vao || !startBuffer || !endBuffer || !correctionBuffer || !categoryBuffer || !selectedBuffer) {
+    if (!vao || !startBuffer || !endBuffer || !startVelocityBuffer || !endVelocityBuffer || !correctionBuffer || !colorBuffer || !selectedBuffer) {
       setCanvasFallback(true);
       gl.deleteProgram(program);
       return;
@@ -821,6 +954,7 @@ function OrbitCanvasGpu({
     let animationFrame = 0;
     let lastReducedFrame = 0;
     let lastSelectedId: number | null | undefined;
+    let lastColorSignature = "";
     let selectedTrail: GeoPosition[] = [];
     let trailKey = "";
 
@@ -834,11 +968,13 @@ function OrbitCanvasGpu({
     };
     bindAttribute("aStart", 3, startBuffer);
     bindAttribute("aEnd", 3, endBuffer);
+    bindAttribute("aStartVelocity", 3, startVelocityBuffer);
+    bindAttribute("aEndVelocity", 3, endVelocityBuffer);
     bindAttribute("aCorrection", 3, correctionBuffer);
-    bindAttribute("aCategory", 1, categoryBuffer);
+    bindAttribute("aColor", 3, colorBuffer);
     bindAttribute("aSelected", 1, selectedBuffer);
-    gl.bindBuffer(gl.ARRAY_BUFFER, categoryBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, Float32Array.from(entries, (entry) => categoryCode(entry.category)), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, entries.length * 3 * Float32Array.BYTES_PER_ELEMENT, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, selectedBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, selectedFlags, gl.DYNAMIC_DRAW);
     gl.bindVertexArray(null);
@@ -867,13 +1003,25 @@ function OrbitCanvasGpu({
       const snapshot = snapshotRef.current;
       if (!snapshot || index < 0 || index >= snapshot.count) return null;
       const span = snapshot.endTime - snapshot.startTime;
-      const progress = span > 0 ? Math.max(0, Math.min(1.5, (at - snapshot.startTime) / span)) : 0;
+      const progress = span > 0 ? Math.max(0, Math.min(1.08, (at - snapshot.startTime) / span)) : 0;
       const ease = Math.max(0, Math.min(1, (timestamp - snapshot.receivedAt) / 1200));
       const correctionWeight = (1 - ease) ** 3;
       const offset = index * 3;
-      const x = snapshot.startPositions[offset] + (snapshot.endPositions[offset] - snapshot.startPositions[offset]) * progress + snapshot.correction[offset] * correctionWeight;
-      const y = snapshot.startPositions[offset + 1] + (snapshot.endPositions[offset + 1] - snapshot.startPositions[offset + 1]) * progress + snapshot.correction[offset + 1] * correctionWeight;
-      const z = snapshot.startPositions[offset + 2] + (snapshot.endPositions[offset + 2] - snapshot.startPositions[offset + 2]) * progress + snapshot.correction[offset + 2] * correctionWeight;
+      const spanSeconds = span / 1000;
+      const progress2 = progress * progress;
+      const progress3 = progress2 * progress;
+      const h00 = 2 * progress3 - 3 * progress2 + 1;
+      const h10 = progress3 - 2 * progress2 + progress;
+      const h01 = -2 * progress3 + 3 * progress2;
+      const h11 = progress3 - progress2;
+      const sampleAxis = (axis: number) => h00 * snapshot.startPositions[offset + axis]
+        + h10 * snapshot.startVelocities[offset + axis] * spanSeconds
+        + h01 * snapshot.endPositions[offset + axis]
+        + h11 * snapshot.endVelocities[offset + axis] * spanSeconds
+        + snapshot.correction[offset + axis] * correctionWeight;
+      const x = sampleAxis(0);
+      const y = sampleAxis(1);
+      const z = sampleAxis(2);
       const radiusKm = Math.hypot(x, y, z);
       if (!Number.isFinite(radiusKm) || radiusKm < 1) return null;
       const radial = 1 + Math.min(0.82, Math.log1p(Math.max(0, radiusKm - earthRadiusKm) / 350) * 0.17);
@@ -960,6 +1108,9 @@ function OrbitCanvasGpu({
       };
       for (let lat = -60; lat <= 60; lat += 30) drawGeoLine(Array.from({ length: 73 }, (_, index) => ({ lat, lon: -180 + index * 5 })));
       for (let lon = -150; lon <= 180; lon += 30) drawGeoLine(Array.from({ length: 37 }, (_, index) => ({ lat: -90 + index * 5, lon })));
+      context.strokeStyle = "rgba(157, 236, 218, .52)";
+      context.lineWidth = 1.15;
+      coastlines.forEach((coastline) => drawGeoLine(coastline.map(([lat, lon]) => ({ lat, lon }))));
       const shade = context.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
       shade.addColorStop(0, "rgba(0, 2, 6, .02)");
       shade.addColorStop(0.6, "rgba(0, 2, 6, .14)");
@@ -999,12 +1150,35 @@ function OrbitCanvasGpu({
         context.shadowBlur = 14;
         context.fill();
         context.shadowBlur = 0;
+        context.font = "600 8px ui-monospace, monospace";
+        context.fillStyle = "rgba(255, 207, 114, .92)";
+        context.fillText(currentObserver.label === "MY LOCATION" ? "YOU" : currentObserver.label.slice(0, 12), screen.x + 8, screen.y - 7);
       }
 
       const selectedIndex = selectedIdRef.current === null ? undefined : entryIndex.get(selectedIdRef.current);
       const selectedPoint = selectedIndex === undefined ? null : pointFromSnapshot(selectedIndex, at, timestamp);
       if (selectedPoint && selectedPoint.z >= 0) {
         const screen = project(selectedPoint);
+        const groundPosition = focusPositionRef.current;
+        if (groundPosition) {
+          const groundPoint = rotateGeo(groundPosition.lat, groundPosition.lon, 1.008);
+          if (groundPoint.z > 0) {
+            const groundScreen = project(groundPoint);
+            context.save();
+            context.setLineDash([3, 4]);
+            context.beginPath();
+            context.moveTo(groundScreen.x, groundScreen.y);
+            context.lineTo(screen.x, screen.y);
+            context.strokeStyle = "rgba(193, 255, 114, .45)";
+            context.lineWidth = 0.85;
+            context.stroke();
+            context.restore();
+            context.beginPath();
+            context.arc(groundScreen.x, groundScreen.y, 2.2, 0, Math.PI * 2);
+            context.fillStyle = "#c1ff72";
+            context.fill();
+          }
+        }
         const label = entries[selectedIndex!].name;
         context.font = "600 10px ui-monospace, monospace";
         const labelWidth = Math.min(180, context.measureText(label).width + 18);
@@ -1024,6 +1198,16 @@ function OrbitCanvasGpu({
       const snapshot = snapshotRef.current;
       if (!snapshot) return;
 
+      const colorSignature = `${colorModeRef.current}:${riskIdsRef.current.join(",")}`;
+      if (colorSignature !== lastColorSignature) {
+        const riskSet = new Set(riskIdsRef.current);
+        const colors = new Float32Array(entries.length * 3);
+        entries.forEach((entry, index) => colors.set(satelliteColor(entry, colorModeRef.current, riskSet), index * 3));
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
+        lastColorSignature = colorSignature;
+      }
+
       if (lastSelectedId !== selectedIdRef.current) {
         selectedFlags.fill(0);
         const selectedIndex = selectedIdRef.current === null ? undefined : entryIndex.get(selectedIdRef.current);
@@ -1034,32 +1218,45 @@ function OrbitCanvasGpu({
       }
 
       const span = snapshot.endTime - snapshot.startTime;
-      const progress = span > 0 ? Math.max(0, Math.min(1.5, (at - snapshot.startTime) / span)) : 0;
+      const progress = span > 0 ? Math.max(0, Math.min(1.08, (at - snapshot.startTime) / span)) : 0;
       const ease = Math.max(0, Math.min(1, (timestamp - snapshot.receivedAt) / 1200));
       const radius = Math.min(width, height) * 0.31 * cameraRef.current.zoom;
       gl.useProgram(program);
       gl.bindVertexArray(vao);
       gl.uniform1f(gl.getUniformLocation(program, "uProgress"), progress);
+      gl.uniform1f(gl.getUniformLocation(program, "uSpanSeconds"), span / 1000);
       gl.uniform1f(gl.getUniformLocation(program, "uCorrectionWeight"), (1 - ease) ** 3);
       gl.uniform1f(gl.getUniformLocation(program, "uYaw"), cameraRef.current.yaw);
       gl.uniform1f(gl.getUniformLocation(program, "uPitch"), cameraRef.current.pitch);
       gl.uniform1f(gl.getUniformLocation(program, "uDisplayScale"), displayScaleRef.current);
       gl.uniform1f(gl.getUniformLocation(program, "uPixelRatio"), ratio);
+      gl.uniform1f(gl.getUniformLocation(program, "uHasSelection"), selectedIdRef.current === null ? 0 : 1);
+      gl.uniform1f(gl.getUniformLocation(program, "uPulse"), (Math.sin(timestamp * 0.005) + 1) * 0.5);
       gl.uniform2f(gl.getUniformLocation(program, "uProjectionScale"), radius * 2 / width, radius * 2 / height);
       gl.drawArraysInstanced(gl.POINTS, 0, 1, snapshot.count);
       gl.bindVertexArray(null);
     };
 
-    const uploadSnapshot = (message: WorkerSnapshot) => {
+    const uploadSnapshot = (message: Omit<OrbitSnapshot, "correction" | "receivedAt">) => {
       const count = message.startPositions.length / 3;
       if (count !== entries.length || message.endPositions.length !== message.startPositions.length) return;
       const prior = snapshotRef.current;
       const correction = new Float32Array(message.startPositions.length);
       if (!hardResetRef.current && prior && prior.count === count) {
         const oldSpan = prior.endTime - prior.startTime;
-        const oldProgress = oldSpan > 0 ? Math.max(0, Math.min(1.5, (message.startTime - prior.startTime) / oldSpan)) : 0;
+        const oldProgress = oldSpan > 0 ? Math.max(0, Math.min(1.08, (message.startTime - prior.startTime) / oldSpan)) : 0;
+        const oldProgress2 = oldProgress * oldProgress;
+        const oldProgress3 = oldProgress2 * oldProgress;
+        const h00 = 2 * oldProgress3 - 3 * oldProgress2 + 1;
+        const h10 = oldProgress3 - 2 * oldProgress2 + oldProgress;
+        const h01 = -2 * oldProgress3 + 3 * oldProgress2;
+        const h11 = oldProgress3 - oldProgress2;
+        const oldSpanSeconds = oldSpan / 1000;
         for (let index = 0; index < correction.length; index += 1) {
-          const predicted = prior.startPositions[index] + (prior.endPositions[index] - prior.startPositions[index]) * oldProgress;
+          const predicted = h00 * prior.startPositions[index]
+            + h10 * prior.startVelocities[index] * oldSpanSeconds
+            + h01 * prior.endPositions[index]
+            + h11 * prior.endVelocities[index] * oldSpanSeconds;
           const delta = predicted - message.startPositions[index];
           correction[index] = Number.isFinite(delta) ? delta : 0;
         }
@@ -1068,16 +1265,24 @@ function OrbitCanvasGpu({
       snapshotRef.current = {
         startPositions: message.startPositions,
         endPositions: message.endPositions,
+        startVelocities: message.startVelocities,
+        endVelocities: message.endVelocities,
         correction,
         startTime: message.startTime,
         endTime: message.endTime,
         receivedAt: performance.now(),
         count,
+        source: message.source,
       };
+      setFrameSource(message.source);
       gl.bindBuffer(gl.ARRAY_BUFFER, startBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, message.startPositions, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, endBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, message.endPositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, startVelocityBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, message.startVelocities, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, endVelocityBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, message.endVelocities, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, correctionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, correction, gl.DYNAMIC_DRAW);
     };
@@ -1086,16 +1291,53 @@ function OrbitCanvasGpu({
     workerRef.current = worker;
     snapshotRef.current = null;
     hardResetRef.current = true;
-    worker.onmessage = (event: MessageEvent<WorkerSnapshot>) => {
-      if (event.data.type === "snapshot") uploadSnapshot(event.data);
+    let workerStarted = false;
+    let serverHealthy = false;
+    let requestSequence = 0;
+    let serverTimer = 0;
+    const abortController = new AbortController();
+
+    const startBrowserFallback = () => {
+      if (workerStarted) {
+        worker.postMessage({ type: "visibility", active: !hidden });
+        return;
+      }
+      workerStarted = true;
+      worker.postMessage({
+        type: "init",
+        entries: entries.map((entry) => entry.omm),
+        offsetMs: timeOffsetRef.current * 60000,
+        pausedAt: pausedAtRef.current,
+        active: !hidden,
+      });
     };
-    worker.postMessage({
-      type: "init",
-      entries: entries.map((entry) => entry.omm),
-      offsetMs: timeOffsetRef.current * 60000,
-      pausedAt: pausedAtRef.current,
-      active: !hidden,
-    });
+
+    worker.onmessage = (event: MessageEvent<WorkerSnapshot>) => {
+      if (event.data.type === "snapshot" && !serverHealthy) uploadSnapshot({ ...event.data, count: event.data.startPositions.length / 3, source: "browser" });
+    };
+
+    const refreshServerFrame = async () => {
+      if (hidden || entries.length === 0) return;
+      const sequence = ++requestSequence;
+      try {
+        const at = simulationMs();
+        const response = await fetch(`/api/orbits?at=${Math.round(at)}`, { signal: abortController.signal });
+        if (!response.ok) throw new Error("Orbit frame unavailable");
+        const frame = parseServerFrame(await response.arrayBuffer(), entries);
+        if (sequence !== requestSequence) return;
+        serverHealthy = true;
+        if (workerStarted) worker.postMessage({ type: "visibility", active: false });
+        uploadSnapshot(frame);
+      } catch (error) {
+        if (abortController.signal.aborted) return;
+        serverHealthy = false;
+        startBrowserFallback();
+        if (error instanceof Error) console.warn("Using browser orbit fallback", error.message);
+      }
+    };
+    refreshFrameRef.current = () => void refreshServerFrame();
+    void refreshServerFrame();
+    serverTimer = window.setInterval(() => void refreshServerFrame(), 25_000);
 
     const draw = (timestamp: number) => {
       animationFrame = requestAnimationFrame(draw);
@@ -1160,7 +1402,8 @@ function OrbitCanvasGpu({
     };
     const visibilityChange = () => {
       hidden = document.visibilityState === "hidden";
-      worker.postMessage({ type: "visibility", active: !hidden });
+      if (workerStarted) worker.postMessage({ type: "visibility", active: !hidden && !serverHealthy });
+      if (!hidden) void refreshServerFrame();
     };
 
     glCanvas.addEventListener("pointerdown", pointerDown);
@@ -1173,6 +1416,9 @@ function OrbitCanvasGpu({
 
     return () => {
       cancelAnimationFrame(animationFrame);
+      window.clearInterval(serverTimer);
+      abortController.abort();
+      if (refreshFrameRef.current) refreshFrameRef.current = null;
       worker.terminate();
       if (workerRef.current === worker) workerRef.current = null;
       glCanvas.removeEventListener("pointerdown", pointerDown);
@@ -1183,8 +1429,10 @@ function OrbitCanvasGpu({
       document.removeEventListener("visibilitychange", visibilityChange);
       gl.deleteBuffer(startBuffer);
       gl.deleteBuffer(endBuffer);
+      gl.deleteBuffer(startVelocityBuffer);
+      gl.deleteBuffer(endVelocityBuffer);
       gl.deleteBuffer(correctionBuffer);
-      gl.deleteBuffer(categoryBuffer);
+      gl.deleteBuffer(colorBuffer);
       gl.deleteBuffer(selectedBuffer);
       gl.deleteVertexArray(vao);
       gl.deleteProgram(program);
@@ -1199,6 +1447,7 @@ function OrbitCanvasGpu({
     <div className="orbit-renderer" role="img" aria-label={messages[locale]["globe.aria"]}>
       <canvas ref={earthCanvasRef} className="earth-canvas" aria-hidden="true" />
       <canvas ref={glCanvasRef} className="satellite-gl" aria-hidden="true" />
+      <div className={`frame-source frame-source--${frameSource}`}>{frameSource === "server" ? "EDGE ORBIT FRAME" : frameSource === "browser" ? "BROWSER BACKUP" : "SYNCING ORBITS"}</div>
     </div>
   );
 }
@@ -1218,15 +1467,18 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>("discover");
   const [displayScale, setDisplayScale] = useState(25);
+  const [colorMode, setColorMode] = useState<ColorMode>("type");
+  const [autonomyMode, setAutonomyMode] = useState<AutonomyMode>("assist");
   const [timeOffset, setTimeOffset] = useState(0);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
   const [clock, setClock] = useState(0);
   const [observer, setObserver] = useState<Observer>({ lat: 37.5665, lon: 126.978, label: "SEOUL" });
   const [locationState, setLocationState] = useState<"idle" | "loading" | "ready" | "denied">("idle");
   const [favorites, setFavorites] = useState<number[]>([]);
-  const [storyMode, setStoryMode] = useState(false);
   const [focusNonce, setFocusNonce] = useState(0);
   const [activeConjunction, setActiveConjunction] = useState<Conjunction | null>(null);
+  const [agentData, setAgentData] = useState<AgentResponse | null>(null);
+  const [activeAgentEventId, setActiveAgentEventId] = useState<string | null>(null);
   const t = messages[locale];
 
   useEffect(() => {
@@ -1235,9 +1487,34 @@ export default function Home() {
       const mode = saved && ["auto", "en", "ko", "ja"].includes(saved) ? saved : "auto";
       setLanguageMode(mode);
       setLocale(mode === "auto" ? detectLocale() : mode);
+      const savedColorMode = window.localStorage.getItem("satellite-agentbase-color-mode") as ColorMode | null;
+      if (savedColorMode && ["type", "constellation", "altitude", "risk"].includes(savedColorMode)) setColorMode(savedColorMode);
+      const savedAutonomyMode = window.localStorage.getItem("satellite-agentbase-autonomy") as AutonomyMode | null;
+      if (savedAutonomyMode && ["manual", "assist", "autopilot"].includes(savedAutonomyMode)) setAutonomyMode(savedAutonomyMode);
     }, 0);
     return () => window.clearTimeout(hydration);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const runAgentCycle = () => fetch(`/api/agent?lat=${observer.lat.toFixed(4)}&lon=${observer.lon.toFixed(4)}`)
+      .then((response) => {
+        if (!response.ok) throw new Error("Agent cycle unavailable");
+        return response.json() as Promise<AgentResponse>;
+      })
+      .then((data) => {
+        if (!cancelled) setAgentData(data);
+      })
+      .catch(() => {
+        if (!cancelled) setAgentData(null);
+      });
+    void runAgentCycle();
+    const timer = window.setInterval(() => void runAgentCycle(), 5 * 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [observer.lat, observer.lon]);
 
   useEffect(() => {
     document.documentElement.lang = locale;
@@ -1297,6 +1574,7 @@ export default function Home() {
       epoch: tuple[3],
       meanMotion: tuple[4],
       inclination: tuple[6],
+      raan: tuple[7],
       bstar: tuple[14],
       category: classify(tuple[0]),
       omm: tuple,
@@ -1319,6 +1597,10 @@ export default function Home() {
   }, [filteredEntries, entries, selectedId]);
 
   const selectedEntry = entries.find((entry) => entry.id === selectedId) ?? null;
+  const riskIds = useMemo(() => Array.from(new Set([
+    ...(signals?.conjunctions.flatMap((event) => [event.id1, event.id2]) ?? []),
+    ...(signals?.decays.map((event) => event.id) ?? []),
+  ])), [signals]);
   const simulationTime = new Date((pausedAt ?? clock) + timeOffset * 60000);
   const selectedPosition = selectedEntry ? propagateEntry(selectedEntry, simulationTime) : null;
 
@@ -1343,17 +1625,6 @@ export default function Home() {
     // Rounded clock keeps this calculation from running every second.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [featured, selectedEntry, observer.lat, observer.lon, passTimeBucket]);
-
-  useEffect(() => {
-    if (!storyMode || featured.length < 2) return;
-    const timer = window.setInterval(() => {
-      const currentIndex = Math.max(0, featured.findIndex((entry) => entry.id === selectedId));
-      const next = featured[(currentIndex + 1) % featured.length];
-      setSelectedId(next.id);
-      setFocusNonce((value) => value + 1);
-    }, 8500);
-    return () => window.clearInterval(timer);
-  }, [storyMode, featured, selectedId]);
 
   const selectAndFocus = (id: number) => {
     setSelectedId(id);
@@ -1397,21 +1668,72 @@ export default function Home() {
     if (target) selectAndFocus(target.id);
   };
 
+  const applyAgentEvent = (event: AgentEvent) => {
+    setActiveAgentEventId(event.id);
+    if (event.action.panel) setPanelTab(event.action.panel);
+    if (event.action.filter) setFilter(event.action.filter);
+    if (event.action.colorMode) setColorMode(event.action.colorMode);
+    const focusId = event.action.focusIds?.find((id) => entries.some((entry) => entry.id === id));
+    if (focusId) selectAndFocus(focusId);
+    if (event.action.timeAt) {
+      const targetTime = Date.parse(event.action.timeAt);
+      if (Number.isFinite(targetTime)) {
+        const minutes = Math.round((targetTime - (pausedAt ?? clock)) / 60_000);
+        setTimeOffset(Math.max(-90, Math.min(1440, minutes)));
+        setPausedAt(null);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (autonomyMode !== "autopilot" || !agentData?.events.length) return;
+    const currentIndex = agentData.events.findIndex((event) => event.id === activeAgentEventId);
+    const next = agentData.events[(currentIndex + 1) % agentData.events.length];
+    const timer = window.setTimeout(() => {
+      setActiveAgentEventId(next.id);
+      if (next.action.panel) setPanelTab(next.action.panel);
+      if (next.action.filter) setFilter(next.action.filter);
+      if (next.action.colorMode) setColorMode(next.action.colorMode);
+      const focusId = next.action.focusIds?.find((id) => entries.some((entry) => entry.id === id));
+      if (focusId) {
+        setSelectedId(focusId);
+        setFocusNonce((value) => value + 1);
+      }
+      if (next.action.timeAt) {
+        const targetTime = Date.parse(next.action.timeAt);
+        if (Number.isFinite(targetTime)) {
+          const minutes = Math.round((targetTime - (pausedAt ?? Date.now())) / 60_000);
+          setTimeOffset(Math.max(-90, Math.min(1440, minutes)));
+          setPausedAt(null);
+        }
+      }
+    }, activeAgentEventId ? 12_000 : 1400);
+    return () => window.clearTimeout(timer);
+  }, [agentData, autonomyMode, activeAgentEventId, entries, pausedAt]);
+
   const dataState = catalog?.status === "live" ? "LIVE" : catalog ? "CACHED" : dataError ? "OFFLINE" : "CONNECTING";
   const trackingTitle = selectedEntry
     ? locale === "ko" ? `${selectedEntry.name}을(를) 추적 중입니다.` : locale === "ja" ? `${selectedEntry.name}を追跡中です。` : `Tracking ${selectedEntry.name}.`
     : t["discover.connecting"];
   const trackingBody = selectedPosition
     ? locale === "ko"
-      ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. Worker가 전체 카탈로그의 SGP4 스냅샷을 계산하고 GPU가 프레임 사이를 보간한 뒤 새 값의 오차를 부드럽게 흡수합니다.`
+      ? `현재 ${selectedPosition.altitude.toFixed(0)} km 상공을 ${selectedPosition.velocity.toFixed(2)} km/s로 이동합니다. 서버가 공통 SGP4 위치·속도 프레임을 계산하고 GPU가 곡선 보간하며, 에이전트가 의미 있는 변화를 계속 감시합니다.`
       : locale === "ja"
-        ? `現在、高度${selectedPosition.altitude.toFixed(0)} kmを${selectedPosition.velocity.toFixed(2)} km/sで移動中です。Workerが全カタログのSGP4スナップショットを計算し、GPUがフレーム間を補間して新しい値との差を滑らかに吸収します。`
-        : `Moving at ${selectedPosition.velocity.toFixed(2)} km/s, ${selectedPosition.altitude.toFixed(0)} km above Earth. A Worker computes full-catalog SGP4 snapshots while the GPU interpolates every frame and smoothly absorbs each new solution.`
+        ? `現在、高度${selectedPosition.altitude.toFixed(0)} kmを${selectedPosition.velocity.toFixed(2)} km/sで移動中です。サーバーが共有SGP4位置・速度フレームを計算し、GPUが曲線補間しながらエージェントが重要な変化を監視します。`
+        : `Moving at ${selectedPosition.velocity.toFixed(2)} km/s, ${selectedPosition.altitude.toFixed(0)} km above Earth. The server computes shared SGP4 position and velocity frames, the GPU curves between them, and agents watch for meaningful changes.`
     : t["discover.loading"];
   const changeLanguage = (mode: LanguageMode) => {
     setLanguageMode(mode);
     window.localStorage.setItem("satellite-agentbase-language", mode);
     setLocale(mode === "auto" ? detectLocale() : mode);
+  };
+  const changeColorMode = (mode: ColorMode) => {
+    setColorMode(mode);
+    window.localStorage.setItem("satellite-agentbase-color-mode", mode);
+  };
+  const changeAutonomyMode = (mode: AutonomyMode) => {
+    setAutonomyMode(mode);
+    window.localStorage.setItem("satellite-agentbase-autonomy", mode);
   };
 
   return (
@@ -1443,7 +1765,7 @@ export default function Home() {
       <main>
         <section className="mission-intro">
           <div>
-            <p className="kicker"><span>LIVE ORBITAL INTELLIGENCE</span> / SGP4 PROPAGATION</p>
+            <p className="kicker"><span>AGENTIC ORBITAL INTELLIGENCE</span> / AX ACTIVE</p>
             <h1>{t["hero.line1"]}<br /><em>{t["hero.line2"]}</em></h1>
           </div>
           <p>{t["hero.body"]}</p>
@@ -1493,6 +1815,8 @@ export default function Home() {
               entries={renderEntries}
               selectedId={selectedId}
               displayScale={displayScale}
+              colorMode={colorMode}
+              riskIds={riskIds}
               timeOffset={timeOffset}
               pausedAt={pausedAt}
               observer={observer}
@@ -1505,6 +1829,15 @@ export default function Home() {
             <div className="globe-help"><span>DRAG</span> {t["globe.drag"]} <i /> <span>SCROLL</span> {t["globe.scroll"]} <i /> <span>CLICK</span> {t["globe.click"]}</div>
             <div className="prediction-status"><i /><span>{t["prediction.label"]}</span><b>{t["prediction.detail"]}</b></div>
             <div className="altitude-note">ALTITUDE VISUALLY COMPRESSED · POSITION IS SGP4</div>
+            <div className="color-console" aria-label={t["color.aria"]}>
+              <span>COLOR INTELLIGENCE</span>
+              <div>
+                {(["type", "constellation", "altitude", "risk"] as ColorMode[]).map((mode) => (
+                  <button key={mode} type="button" className={colorMode === mode ? "active" : ""} aria-pressed={colorMode === mode} onClick={() => changeColorMode(mode)}>{t[`color.${mode}`]}</button>
+                ))}
+              </div>
+              <small>{t[`color.${colorMode}.detail`]}</small>
+            </div>
             {selectedEntry && selectedPosition && (
               <article className="selected-card" aria-live="polite">
                 <div className="selected-card__head">
@@ -1521,14 +1854,32 @@ export default function Home() {
                 </dl>
                 <div className="selected-actions">
                   <button type="button" onClick={() => setFocusNonce((value) => value + 1)}>{t["selected.center"]}</button>
-                  <button type="button" className={storyMode ? "active" : ""} aria-pressed={storyMode} onClick={() => setStoryMode((value) => !value)}>{storyMode ? t["story.stop"] : t["story.start"]}</button>
+                  <button type="button" className={autonomyMode === "autopilot" ? "active" : ""} aria-pressed={autonomyMode === "autopilot"} onClick={() => changeAutonomyMode(autonomyMode === "autopilot" ? "assist" : "autopilot")}>{autonomyMode === "autopilot" ? t["story.stop"] : t["story.start"]}</button>
                 </div>
               </article>
             )}
           </div>
 
           <aside className="agent-panel" aria-label={t["agent.aria"]}>
-            <div className="panel-title"><span>02</span><div><small>AGENT BRIEF</small><strong>{t["agent.subtitle"]}</strong></div></div>
+            <div className="panel-title"><span>02</span><div><small>AGENT MISSION</small><strong>{t["agent.mission.subtitle"]}</strong></div></div>
+            <div className="agent-runtime">
+              <div className="agent-runtime__status">
+                <span><i /> {agentData ? "AX ACTIVE" : "AGENTS SYNCING"}</span>
+                <b>{agentData ? `${formatNumber(agentData.monitoredObjects, locale)} WATCHED` : "CONNECTING"}</b>
+              </div>
+              <div className="autonomy-switch" role="group" aria-label={t["agent.autonomy.aria"]}>
+                {(["manual", "assist", "autopilot"] as AutonomyMode[]).map((mode) => (
+                  <button key={mode} type="button" className={autonomyMode === mode ? "active" : ""} aria-pressed={autonomyMode === mode} onClick={() => changeAutonomyMode(mode)}>{t[`agent.autonomy.${mode}`]}</button>
+                ))}
+              </div>
+              <div className="agent-roster">
+                {(agentData?.agents ?? [
+                  { id: "SENTINEL", state: "syncing", detail: "Risk scan" },
+                  { id: "SCOUT", state: "syncing", detail: "Pattern scan" },
+                  { id: "SKY", state: "syncing", detail: "Pass scan" },
+                ]).map((agent) => <span key={agent.id} title={agent.detail}><i /> <b>{agent.id}</b> {agent.state}</span>)}
+              </div>
+            </div>
             <div className="agent-tabs" role="tablist" aria-label={t["tabs.aria"]}>
               {(["discover", "risk", "sky"] as PanelTab[]).map((tab) => (
                 <button key={tab} type="button" role="tab" aria-selected={panelTab === tab} className={panelTab === tab ? "active" : ""} onClick={() => setPanelTab(tab)}>
@@ -1540,8 +1891,21 @@ export default function Home() {
 
             {panelTab === "discover" && (
               <div className="agent-scroll">
+                <div className="mission-feed" aria-live="polite">
+                  <div className="mission-feed__head"><span>PRIORITY SIGNALS</span><small>{agentData ? `${formatNumber(agentData.evaluatedSignals, locale)} EVALUATED` : "SCANNING"}</small></div>
+                  {agentData?.events.slice(0, 3).map((event) => (
+                    <article key={event.id} className={`mission-event mission-event--${event.kind}${activeAgentEventId === event.id ? " active" : ""}`}>
+                      <div><span>{event.agent}</span><b>P{event.priority}</b></div>
+                      <h3>{event.title[locale]}</h3>
+                      <p>{event.body[locale]}</p>
+                      <div className="mission-event__meta"><span>{Math.round(event.confidence * 100)}% {t["agent.confidence"]}</span><time>{relativeTime(event.createdAt, simulationTime, locale)}</time></div>
+                      <details><summary>{t["agent.evidence"]}</summary>{event.evidence.map((item) => <small key={item}>{item}</small>)}</details>
+                      <button type="button" onClick={() => applyAgentEvent(event)}>{t["agent.show"]} <span>→</span></button>
+                    </article>
+                  )) ?? <div className="agent-cycle-skeleton"><i /><i /><i /></div>}
+                </div>
                 <article className="agent-lead agent-lead--fun">
-                  <div><span>✦ LIVE DISCOVERY</span><time>{relativeTime(simulationTime, simulationTime, locale)}</time></div>
+                  <div><span>✦ AGENT FOCUS</span><time>{relativeTime(simulationTime, simulationTime, locale)}</time></div>
                   <h3>{trackingTitle}</h3>
                   <p>{trackingBody}</p>
                 </article>

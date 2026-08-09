@@ -22,6 +22,7 @@ type VisibilityMessage = { type: "visibility"; active: boolean };
 type IncomingMessage = InitMessage | ControlMessage | VisibilityMessage;
 
 const cadenceMs = 2500;
+const earthRotationRadiansPerSecond = 7.29211514670698e-5;
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 let satrecs: Array<SatRec | null> = [];
 let offsetMs = 0;
@@ -77,6 +78,8 @@ function sample() {
   const endGmst = gstime(endDate);
   const startPositions = new Float32Array(satrecs.length * 3);
   const endPositions = new Float32Array(satrecs.length * 3);
+  const startVelocities = new Float32Array(satrecs.length * 3);
+  const endVelocities = new Float32Array(satrecs.length * 3);
 
   for (let index = 0; index < satrecs.length; index += 1) {
     const offset = index * 3;
@@ -90,12 +93,20 @@ function sample() {
     }
     const firstEcf = eciToEcf(first.position, startGmst);
     const secondEcf = pausedAt === null ? eciToEcf(second.position, endGmst) : firstEcf;
+    const firstVelocity = eciToEcf(first.velocity, startGmst);
+    const secondVelocity = pausedAt === null ? eciToEcf(second.velocity, endGmst) : firstVelocity;
     startPositions[offset] = firstEcf.x;
     startPositions[offset + 1] = firstEcf.y;
     startPositions[offset + 2] = firstEcf.z;
     endPositions[offset] = secondEcf.x;
     endPositions[offset + 1] = secondEcf.y;
     endPositions[offset + 2] = secondEcf.z;
+    startVelocities[offset] = firstVelocity.x + earthRotationRadiansPerSecond * firstEcf.y;
+    startVelocities[offset + 1] = firstVelocity.y - earthRotationRadiansPerSecond * firstEcf.x;
+    startVelocities[offset + 2] = firstVelocity.z;
+    endVelocities[offset] = secondVelocity.x + earthRotationRadiansPerSecond * secondEcf.y;
+    endVelocities[offset + 1] = secondVelocity.y - earthRotationRadiansPerSecond * secondEcf.x;
+    endVelocities[offset + 2] = secondVelocity.z;
   }
 
   workerScope.postMessage({
@@ -106,7 +117,9 @@ function sample() {
     computeMs: performance.now() - startedAt,
     startPositions,
     endPositions,
-  }, [startPositions.buffer, endPositions.buffer]);
+    startVelocities,
+    endVelocities,
+  }, [startPositions.buffer, endPositions.buffer, startVelocities.buffer, endVelocities.buffer]);
 }
 
 workerScope.onmessage = (event: MessageEvent<IncomingMessage>) => {
