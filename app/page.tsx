@@ -887,7 +887,7 @@ function OrbitCanvasGpu({
   onSelect: (id: number) => void;
 }) {
   const [canvasFallback, setCanvasFallback] = useState(false);
-  const [frameSource, setFrameSource] = useState<"connecting" | "server" | "browser">("connecting");
+  const [frameSource, setFrameSource] = useState<"connecting" | "resyncing" | "server" | "browser">("connecting");
   const [motionFps, setMotionFps] = useState(0);
   const earthCanvasRef = useRef<HTMLCanvasElement>(null);
   const glCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -969,6 +969,8 @@ function OrbitCanvasGpu({
     const entryIndex = new Map(entries.map((entry, index) => [entry.id, index]));
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let hidden = document.visibilityState === "hidden";
+    let hiddenAt = hidden ? Date.now() : null;
+    let lastActiveWallTime = Date.now();
     let animationFrame = 0;
     let lastReducedFrame = 0;
     let lastSelectedId: number | null | undefined;
@@ -1414,6 +1416,7 @@ function OrbitCanvasGpu({
         uploadSnapshot(frame);
       } catch (error) {
         if (abortController.signal.aborted) return;
+        if (sequence !== requestSequence) return;
         serverHealthy = false;
         startBrowserFallback();
         if (error instanceof Error) console.warn("Using browser orbit fallback", error.message);
@@ -1434,6 +1437,7 @@ function OrbitCanvasGpu({
         fpsWindowStarted = timestamp;
       }
       const at = simulationMs();
+      lastActiveWallTime = Date.now();
       const nextTrailKey = `${selectedIdRef.current ?? "none"}-${Math.floor(at / 600000)}`;
       if (nextTrailKey !== trailKey) {
         trailKey = nextTrailKey;
@@ -1492,10 +1496,36 @@ function OrbitCanvasGpu({
       cameraRef.current.zoom = Math.max(0.72, Math.min(1.35, cameraRef.current.zoom - event.deltaY * 0.0005));
       lowDetailUntil = performance.now() + 220;
     };
+    const resumeFromBackground = (forceHardReset = false) => {
+      const now = Date.now();
+      const inactiveFor = hiddenAt === null ? Math.max(0, now - lastActiveWallTime) : Math.max(0, now - hiddenAt);
+      hiddenAt = null;
+      hidden = false;
+      fpsFrames = 0;
+      fpsWindowStarted = performance.now();
+      setMotionFps(0);
+      if (forceHardReset || inactiveFor >= 3000) {
+        requestSequence += 1;
+        hardResetRef.current = true;
+        trailKey = "";
+        selectedTrail = [];
+        setFrameSource("resyncing");
+      }
+      if (workerStarted) worker.postMessage({ type: "visibility", active: !serverHealthy });
+      void refreshServerFrame();
+    };
     const visibilityChange = () => {
       hidden = document.visibilityState === "hidden";
-      if (workerStarted) worker.postMessage({ type: "visibility", active: !hidden && !serverHealthy });
-      if (!hidden) void refreshServerFrame();
+      if (hidden) {
+        hiddenAt = Date.now();
+        requestSequence += 1;
+        if (workerStarted) worker.postMessage({ type: "visibility", active: false });
+        return;
+      }
+      resumeFromBackground();
+    };
+    const pageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) resumeFromBackground(true);
     };
 
     glCanvas.addEventListener("pointerdown", pointerDown);
@@ -1504,6 +1534,7 @@ function OrbitCanvasGpu({
     glCanvas.addEventListener("pointercancel", pointerUp);
     glCanvas.addEventListener("wheel", wheel, { passive: false });
     document.addEventListener("visibilitychange", visibilityChange);
+    window.addEventListener("pageshow", pageShow);
     animationFrame = requestAnimationFrame(draw);
 
     return () => {
@@ -1520,6 +1551,7 @@ function OrbitCanvasGpu({
       glCanvas.removeEventListener("pointercancel", pointerUp);
       glCanvas.removeEventListener("wheel", wheel);
       document.removeEventListener("visibilitychange", visibilityChange);
+      window.removeEventListener("pageshow", pageShow);
       gl.deleteBuffer(startBuffer);
       gl.deleteBuffer(endBuffer);
       gl.deleteBuffer(startVelocityBuffer);
@@ -1541,7 +1573,7 @@ function OrbitCanvasGpu({
       <canvas ref={earthCanvasRef} className="earth-canvas" aria-hidden="true" />
       <canvas ref={glCanvasRef} className="satellite-gl" aria-hidden="true" />
       <div className={`frame-source frame-source--${frameSource}`}>
-        {frameSource === "server" ? "EDGE ORBIT FRAME" : frameSource === "browser" ? "BROWSER BACKUP" : "SYNCING ORBITS"}
+        {frameSource === "server" ? "EDGE ORBIT FRAME" : frameSource === "browser" ? "BROWSER BACKUP" : frameSource === "resyncing" ? "RESYNCING NOW" : "SYNCING ORBITS"}
         <b>{motionFps > 0 ? `${motionFps} FPS` : "MOTION SYNC"}</b>
       </div>
     </div>
