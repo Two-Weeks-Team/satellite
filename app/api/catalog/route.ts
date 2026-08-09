@@ -20,8 +20,19 @@ export type CompactOmm = [
   number,
 ];
 
-const SOURCE = "https://celestrak.org/NORAD/elements/gp.php?GROUP=ACTIVE&FORMAT=CSV";
 const TWO_HOURS = 60 * 60 * 2;
+const FAILURE_CACHE_SECONDS = 30;
+const SOURCE_TIMEOUT_MS = 4_000;
+const sources = [
+  {
+    url: "https://retlector.eu/csv/active",
+    label: "CelesTrak GP via ReTLEctor cache",
+  },
+  {
+    url: "https://celestrak.org/NORAD/elements/gp.php?GROUP=ACTIVE&FORMAT=CSV",
+    label: "CelesTrak / USSF GP",
+  },
+] as const;
 
 const fallback: CompactOmm[] = [
   ["STARLINK-1329", 45531, "2020-025A", "2026-08-09T00:00:02.000160", 15.83331187, 0.0000603, 53.0364, 46.501, 126.5123, 117.9607, 0, "U", 999, 565, 0.00053184, 0.0011864, 0],
@@ -106,28 +117,59 @@ function compact(record: UpstreamOmm): CompactOmm | null {
   ];
 }
 
-async function fetchCatalog() {
-  const response = await fetch(SOURCE, {
-    headers: { accept: "text/csv" },
-    cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
-  } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
-
-  if (!response.ok) throw new Error(`CelesTrak responded ${response.status}`);
-  const csv = await response.text();
-  const [header = [], ...rows] = parseCsv(csv);
-  const items = rows
-    .map((row) => Object.fromEntries(header.map((key, index) => [key.trim(), row[index] ?? ""])))
-    .map(compact)
-    .filter((item): item is CompactOmm => item !== null);
-  if (items.length < 100) throw new Error("CelesTrak catalog was unexpectedly small");
-  return items;
+async function fetchCatalogSource(source: (typeof sources)[number]) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(source.url, {
+      headers: { accept: "text/csv" },
+      signal: controller.signal,
+      cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
+    } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+    if (!response.ok) throw new Error(`${source.label} responded ${response.status}`);
+    const csv = await response.text();
+    const [header = [], ...rows] = parseCsv(csv);
+    const items = rows
+      .map((row) => Object.fromEntries(header.map((key, index) => [key.trim(), row[index] ?? ""])))
+      .map(compact)
+      .filter((item): item is CompactOmm => item !== null);
+    if (items.length < 100) throw new Error(`${source.label} catalog was unexpectedly small`);
+    return { items, source: source.label };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-export async function loadCatalog() {
+async function fetchCatalog() {
+  const failures: string[] = [];
+  for (const source of sources) {
+    try {
+      return await fetchCatalogSource(source);
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : `${source.label} unavailable`);
+    }
+  }
+  throw new Error(failures.join("; "));
+}
+
+type CatalogResult =
+  | { status: "live"; source: string; fetchedAt: string; count: number; items: CompactOmm[] }
+  | { status: "cached-sample"; source: string; fetchedAt: string; count: number; items: CompactOmm[]; message: string };
+
+let catalogCache: CatalogResult | null = null;
+let catalogPromise: Promise<CatalogResult> | null = null;
+
+function cacheIsFresh(catalog: CatalogResult) {
+  const age = Date.now() - Date.parse(catalog.fetchedAt);
+  const maxAge = (catalog.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS) * 1000;
+  return Number.isFinite(age) && age >= 0 && age < maxAge;
+}
+
+async function loadCatalogOnce(): Promise<CatalogResult> {
   const fetchedAt = new Date().toISOString();
   try {
-    const items = await fetchCatalog();
-    return { status: "live" as const, source: "CelesTrak / USSF GP", fetchedAt, count: items.length, items };
+    const result = await fetchCatalog();
+    return { status: "live", source: result.source, fetchedAt, count: result.items.length, items: result.items };
   } catch (error) {
     return {
       status: "cached-sample" as const,
@@ -140,8 +182,22 @@ export async function loadCatalog() {
   }
 }
 
+export async function loadCatalog() {
+  if (catalogCache && cacheIsFresh(catalogCache)) return catalogCache;
+  if (catalogPromise) return catalogPromise;
+  catalogPromise = loadCatalogOnce()
+    .then((catalog) => {
+      catalogCache = catalog;
+      return catalog;
+    })
+    .finally(() => {
+      catalogPromise = null;
+    });
+  return catalogPromise;
+}
+
 export async function GET() {
   const catalog = await loadCatalog();
-  const cacheSeconds = catalog.status === "live" ? TWO_HOURS : 300;
+  const cacheSeconds = catalog.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS;
   return Response.json(catalog, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
 }

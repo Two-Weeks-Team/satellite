@@ -382,7 +382,7 @@ function createOrbitProgram(gl: WebGL2RenderingContext) {
       float z1 = point.x * sy + point.z * cy;
       float y2 = point.y * cp - z1 * sp;
       float z2 = point.y * sp + z1 * cp;
-      vec2 projected = vec2(x1 * uProjectionScale.x, y2 * uProjectionScale.y);
+      vec2 projected = vec2(-x1 * uProjectionScale.x, y2 * uProjectionScale.y);
       gl_Position = vec4(projected.x, projected.y + 0.02, 0.0, 1.0);
       float normalSize = 1.35 + log2(max(2.0, uDisplayScale)) * 0.58;
       gl_PointSize = (aSelected > 0.5 ? normalSize + 7.0 + uPulse * 2.0 : normalSize) * uPixelRatio;
@@ -631,7 +631,7 @@ function OrbitCanvas({
       const z1 = x * Math.sin(yaw) + z * Math.cos(yaw);
       const y2 = y * Math.cos(pitch) - z1 * Math.sin(pitch);
       const z2 = y * Math.sin(pitch) + z1 * Math.cos(pitch);
-      return { x: x1, y: y2, z: z2 };
+      return { x: -x1, y: y2, z: z2 };
     };
 
     const draw = (timestamp: number) => {
@@ -1034,7 +1034,7 @@ function OrbitCanvasGpu({
       const x1 = x * Math.cos(yaw) - z * Math.sin(yaw);
       const z1 = x * Math.sin(yaw) + z * Math.cos(yaw);
       return {
-        x: x1,
+        x: -x1,
         y: y * Math.cos(pitch) - z1 * Math.sin(pitch),
         z: y * Math.sin(pitch) + z1 * Math.cos(pitch),
       };
@@ -1073,7 +1073,7 @@ function OrbitCanvasGpu({
       const x1 = pointX * Math.cos(yaw) - pointZ * Math.sin(yaw);
       const z1 = pointX * Math.sin(yaw) + pointZ * Math.cos(yaw);
       return {
-        x: x1,
+        x: -x1,
         y: pointY * Math.cos(pitch) - z1 * Math.sin(pitch),
         z: pointY * Math.sin(pitch) + z1 * Math.cos(pitch),
       };
@@ -1118,7 +1118,7 @@ function OrbitCanvasGpu({
         .translate([centerX, centerY])
         .scale(radius)
         .rotate([-longitude, -latitude])
-        .reflectX(true)
+        .reflectX(false)
         .clipAngle(90)
         .precision(lowDetail ? 0.55 : 0.28);
       const path = geoPath(projection);
@@ -1401,6 +1401,10 @@ function OrbitCanvasGpu({
     worker.onmessage = (event: MessageEvent<WorkerSnapshot>) => {
       if (event.data.type === "snapshot" && !serverHealthy) uploadSnapshot({ ...event.data, count: event.data.startPositions.length / 3, source: "browser" });
     };
+
+    // Populate the globe immediately while the authoritative server frame is in flight.
+    // The worker is paused as soon as the server succeeds, so it is only a startup safety net.
+    startBrowserFallback();
 
     const refreshServerFrame = async () => {
       if (hidden || entries.length === 0) return;
