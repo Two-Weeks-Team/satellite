@@ -365,7 +365,7 @@ export default function Home() {
               <a className="text-button" href="#agent">에이전트 브리핑 보기 <span>→</span></a>
             </div>
             <dl className="hero-metrics">
-              <div><dt>VISUAL SCALE</dt><dd>2×—1000×</dd></div>
+              <div><dt>OBJECT DISPLAY</dt><dd>2×—1000×</dd></div>
               <div><dt>AGENT MODES</dt><dd>RISK + FUN</dd></div>
               <div><dt>VIEW</dt><dd>EARTH / LOCAL</dd></div>
             </dl>
@@ -451,25 +451,26 @@ export default function Home() {
 
             <div className="scale-control">
               <div className="scale-reading">
-                <span>OBJECT SCALE</span>
+                <span>OBJECT DISPLAY SCALE</span>
                 <strong>{scale}×</strong>
               </div>
               <input
                 type="range"
-                min="2"
-                max="1000"
-                step="1"
-                value={scale}
+                min="1"
+                max={Math.log2(1000)}
+                step="0.01"
+                value={Math.log2(scale)}
                 aria-label="위성 시각화 배율"
-                onChange={(event) => setScale(Number(event.target.value))}
-                style={{ "--range-progress": `${((scale - 2) / 998) * 100}%` } as React.CSSProperties}
+                aria-valuetext={`${scale}배, 위성 표시 크기만 확대`}
+                onChange={(event) => setScale(Math.round(2 ** Number(event.target.value)))}
+                style={{ "--range-progress": `${((Math.log2(scale) - 1) / (Math.log2(1000) - 1)) * 100}%` } as React.CSSProperties}
               />
               <div className="scale-stops">
                 {scaleStops.map((stop) => (
                   <button type="button" key={stop} className={scale === stop ? "active" : ""} onClick={() => setScale(stop)}>{stop}×</button>
                 ))}
               </div>
-              <div className="simulation-note"><span>SIM</span> 시뮬레이션 데이터 · 실제 경보가 아닙니다</div>
+              <div className="simulation-note"><span>SIM</span> 위성 표시 크기만 확대 · 실제 경보가 아닙니다</div>
             </div>
           </div>
         </section>
@@ -522,7 +523,7 @@ export default function Home() {
           <div className="section-heading section-heading--wide">
             <p className="eyebrow"><span>03</span> PROACTIVE AGENT</p>
             <h2>질문을 기다리지 않는<br /><em>우주 관제 에이전트.</em></h2>
-            <p>모든 데이터를 보여주는 대신, 지금 알아야 할 사건을 골라 맥락과 함께 브리핑합니다.</p>
+            <p>모든 데이터를 보여주는 대신, 지금 알아야 할 사건을 골라 맥락과 함께 브리핑합니다. <span className="inline-demo-note">SIMULATED EVENTS</span></p>
           </div>
 
           <div className="agent-console">

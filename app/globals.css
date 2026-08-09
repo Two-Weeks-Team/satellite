@@ -53,6 +53,11 @@ button {
   color: inherit;
 }
 
+:where(a, button, input):focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
 ::selection {
   background: var(--lime);
   color: #071007;
@@ -793,6 +798,16 @@ button {
   font-size: 15px;
   line-height: 1.85;
   word-break: keep-all;
+}
+
+.inline-demo-note {
+  display: inline-block;
+  margin-left: 8px;
+  color: #64747b;
+  font-family: var(--font-mono);
+  font-size: 7px;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
 }
 
 .scale-story {
