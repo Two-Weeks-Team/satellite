@@ -1113,7 +1113,7 @@ function OrbitCanvasGpu({
       if (mapCache?.key === key) return mapCache;
       if (lowDetail && mapCache && timestamp - lastMapBuild < 190) return mapCache;
 
-      const layers = lowDetail ? world110 : detailedWorld;
+      const layers = lowDetail || !detailedWorld ? world110 : detailedWorld;
       const projection = geoOrthographic()
         .translate([centerX, centerY])
         .scale(radius)

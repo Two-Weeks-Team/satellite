@@ -13,10 +13,19 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://satellite.agentba.se"),
   title: "satellite.agentba.se",
   description: "Live orbital intelligence with predictive motion, SGP4 reconciliation, close-approach signals and local sky passes.",
-  other: {
-    "codex-preview": "development",
+  openGraph: {
+    title: "satellite.agentba.se",
+    description: "Live orbital intelligence with predictive motion, SGP4 reconciliation, close-approach signals and local sky passes.",
+    type: "website",
+    url: "/",
+  },
+  twitter: {
+    card: "summary",
+    title: "satellite.agentba.se",
+    description: "Live orbital intelligence with predictive motion, SGP4 reconciliation, close-approach signals and local sky passes.",
   },
   icons: {
     icon: "/favicon.svg",

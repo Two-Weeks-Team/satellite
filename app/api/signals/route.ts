@@ -92,8 +92,8 @@ async function cachedFetchText(url: string, accept: string) {
     const response = await fetch(url, {
       headers: { accept },
       signal: controller.signal,
-      cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
-    } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+      next: { revalidate: TWO_HOURS },
+    } as RequestInit & { next: { revalidate: number } });
     if (!response.ok) throw new Error(`${new URL(url).hostname} ${response.status}`);
     return await response.text();
   } finally {

@@ -124,8 +124,8 @@ async function fetchCatalogSource(source: (typeof sources)[number]) {
     const response = await fetch(source.url, {
       headers: { accept: "text/csv" },
       signal: controller.signal,
-      cf: { cacheEverything: true, cacheTtl: TWO_HOURS },
-    } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+      next: { revalidate: TWO_HOURS },
+    } as RequestInit & { next: { revalidate: number } });
     if (!response.ok) throw new Error(`${source.label} responded ${response.status}`);
     const csv = await response.text();
     const [header = [], ...rows] = parseCsv(csv);
