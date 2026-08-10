@@ -27,6 +27,7 @@ type SpaceWeather = {
 type SignalsResult = {
   status: "live" | "partial" | "offline";
   fetchedAt: string;
+  cachedAt?: string;
   conjunctions: Conjunction[];
   decays: Decay[];
   spaceWeather: SpaceWeather | null;
@@ -37,7 +38,15 @@ type SignalsResult = {
   };
 };
 
-const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
+type RawSignalSources = {
+  conjunctions: string | null;
+  decays: string | null;
+  spaceWeather: string | null;
+};
+
+type UpstreamSignalsResult = SignalsResult & { rawSources?: RawSignalSources };
+
+const SOCRATES = "https://celestrak.org/SOCRATES-Plus/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
 const TWO_HOURS = 60 * 60 * 2;
@@ -128,10 +137,6 @@ async function cachedFetchText(url: string, accept: string) {
   }
 }
 
-async function cachedFetchJson<T>(url: string) {
-  return JSON.parse(await cachedFetchText(url, "application/json")) as T;
-}
-
 function isStoredSignals(value: unknown): value is SignalsResult {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<SignalsResult>;
@@ -165,28 +170,29 @@ async function loadStoredSignals(): Promise<SignalsResult | null> {
   }
 }
 
-async function loadUpstreamSignals(): Promise<SignalsResult> {
+async function loadUpstreamSignals(includeRaw = false): Promise<UpstreamSignalsResult> {
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
-    cachedFetchText(SOCRATES, "text/html").then(parseConjunctions),
-    cachedFetchJson<Array<Record<string, string | number>>>(DECAYING).then((data) => {
-      return data.slice(0, 20).map((item): Decay => ({
+    cachedFetchText(SOCRATES, "text/html").then((raw) => ({ raw, value: parseConjunctions(raw) })),
+    cachedFetchText(DECAYING, "application/json").then((raw) => {
+      const data = JSON.parse(raw) as Array<Record<string, string | number>>;
+      return { raw, value: data.slice(0, 20).map((item): Decay => ({
         id: Number(item.NORAD_CAT_ID),
         name: String(item.OBJECT_NAME),
         epoch: String(item.EPOCH),
         meanMotion: Number(item.MEAN_MOTION),
         bstar: Number(item.BSTAR),
-      }));
+      })) };
     }),
-    cachedFetchJson<unknown>(KP).then(currentKp),
+    cachedFetchText(KP, "application/json").then((raw) => ({ raw, value: currentKp(JSON.parse(raw)) })),
   ]);
 
-  const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
-  const decays = decayResult.status === "fulfilled" ? decayResult.value : [];
-  const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
+  const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value.value : [];
+  const decays = decayResult.status === "fulfilled" ? decayResult.value.value : [];
+  const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value.value : null;
   const liveSources = [conjunctions.length > 0, decays.length > 0, spaceWeather !== null].filter(Boolean).length;
 
-  return {
+  const result: UpstreamSignalsResult = {
     status: liveSources === 3 ? "live" as const : liveSources > 0 ? "partial" as const : "offline" as const,
     fetchedAt,
     conjunctions,
@@ -198,18 +204,26 @@ async function loadUpstreamSignals(): Promise<SignalsResult> {
       spaceWeather: "NOAA SWPC",
     },
   };
+  if (includeRaw) {
+    result.rawSources = {
+      conjunctions: conjunctionResult.status === "fulfilled" ? conjunctionResult.value.raw : null,
+      decays: decayResult.status === "fulfilled" ? decayResult.value.raw : null,
+      spaceWeather: kpResult.status === "fulfilled" ? kpResult.value.raw : null,
+    };
+  }
+  return result;
 }
 
 async function loadSignalsOnce(): Promise<SignalsResult> {
   const stored = await loadStoredSignals();
-  return stored ?? loadUpstreamSignals();
+  return stored ? { ...stored, cachedAt: new Date().toISOString() } : loadUpstreamSignals();
 }
 
 let signalsCache: SignalsResult | null = null;
 let signalsPromise: Promise<SignalsResult> | null = null;
 
 function signalsCacheIsFresh(signals: SignalsResult) {
-  const age = Date.now() - Date.parse(signals.fetchedAt);
+  const age = Date.now() - Date.parse(signals.cachedAt ?? signals.fetchedAt);
   const maxAge = (signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS) * 1000;
   return Number.isFinite(age) && age >= 0 && age < maxAge;
 }
@@ -236,7 +250,7 @@ export async function GET(request: Request) {
     if (!expected || authorization !== `Bearer ${expected}`) {
       return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "Cache-Control": "no-store" } });
     }
-    const signals = await loadUpstreamSignals();
+    const signals = await loadUpstreamSignals(true);
     return Response.json(signals, { headers: { "Cache-Control": "private, no-store" } });
   }
   const signals = await loadSignals();

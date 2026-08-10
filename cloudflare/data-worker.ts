@@ -38,6 +38,12 @@ type SpaceWeather = {
   level: "quiet" | "active" | "storm" | "severe";
 };
 
+type RawSignalSources = {
+  conjunctions: string | null;
+  decays: string | null;
+  spaceWeather: string | null;
+};
+
 type CatalogObject = {
   noradId: number;
   objectName: string;
@@ -126,18 +132,50 @@ async function fetchUpstreamProxy(env: Env) {
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`Upstream proxy responded ${response.status}`);
-    const value = await response.json() as {
-      conjunctions?: Conjunction[];
-      decays?: Decay[];
-      spaceWeather?: SpaceWeather | null;
+    const relayResponse = await response.text();
+    const value = JSON.parse(relayResponse) as {
+      conjunctions?: unknown[];
+      decays?: unknown[];
+      spaceWeather?: unknown;
+      rawSources?: Partial<RawSignalSources>;
     };
     if (!Array.isArray(value.conjunctions) || !Array.isArray(value.decays)) {
       throw new Error("Upstream proxy returned an invalid payload");
     }
+    const isConjunction = (item: unknown): item is Conjunction => {
+      const candidate = item as Partial<Conjunction> | null;
+      return !!candidate && typeof candidate === "object"
+        && Number.isFinite(candidate.id1) && Number.isFinite(candidate.id2)
+        && typeof candidate.name1 === "string" && typeof candidate.name2 === "string"
+        && typeof candidate.tca === "string" && Number.isFinite(Date.parse(candidate.tca))
+        && [candidate.rangeKm, candidate.relativeSpeed, candidate.maxProbability, candidate.dilutionKm]
+          .every((number) => Number.isFinite(number));
+    };
+    const isDecay = (item: unknown): item is Decay => {
+      const candidate = item as Partial<Decay> | null;
+      return !!candidate && typeof candidate === "object"
+        && Number.isFinite(candidate.id) && typeof candidate.name === "string"
+        && typeof candidate.epoch === "string" && Number.isFinite(Date.parse(candidate.epoch))
+        && Number.isFinite(candidate.meanMotion) && Number.isFinite(candidate.bstar);
+    };
+    const isSpaceWeather = (item: unknown): item is SpaceWeather => {
+      const candidate = item as Partial<SpaceWeather> | null;
+      return !!candidate && typeof candidate === "object"
+        && typeof candidate.time === "string" && Number.isFinite(Date.parse(candidate.time))
+        && Number.isFinite(candidate.kp)
+        && ["quiet", "active", "storm", "severe"].includes(String(candidate.level));
+    };
+    const rawSource = (value: unknown) => typeof value === "string" && value.length <= 10_000_000 ? value : null;
     return {
-      conjunctions: value.conjunctions,
-      decays: value.decays,
-      spaceWeather: value.spaceWeather ?? null,
+      conjunctions: value.conjunctions.filter(isConjunction),
+      decays: value.decays.filter(isDecay),
+      spaceWeather: isSpaceWeather(value.spaceWeather) ? value.spaceWeather : null,
+      rawSources: {
+        conjunctions: rawSource(value.rawSources?.conjunctions),
+        decays: rawSource(value.rawSources?.decays),
+        spaceWeather: rawSource(value.rawSources?.spaceWeather),
+      },
+      relayResponse,
     };
   } finally {
     clearTimeout(timeout);
@@ -331,28 +369,50 @@ async function failRun(db: D1Database, id: string, error: unknown) {
   ).bind(Date.now(), message.slice(0, 1000), id).run();
 }
 
+async function pruneRuns(db: D1Database, now: number) {
+  await db.prepare("DELETE FROM ingestion_runs WHERE started_at < ?")
+    .bind(now - HISTORY_RETENTION_MS)
+    .run();
+}
+
 async function ingestSignals(env: Env) {
   const startedAt = Date.now();
+  const parts = utcParts(startedAt);
+  const archiveBase = `signals/${parts.path}/${parts.time}`;
   const runId = await createRun(env.DB, "signals", startedAt);
   try {
     const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
-      fetchText(SOCRATES, "text/html").then(parseConjunctions),
-      fetchText(DECAYING, "application/json").then((text) => {
-        const data = JSON.parse(text) as Array<Record<string, unknown>>;
-        return data.slice(0, 20).map((item): Decay => ({
+      fetchText(SOCRATES, "text/html").then(async (raw) => {
+        const archiveKey = `${archiveBase}/socrates.html`;
+        await putArchive(env.ARCHIVE, archiveKey, raw, "text/html");
+        return { archiveKey, value: parseConjunctions(raw) };
+      }),
+      fetchText(DECAYING, "application/json").then(async (raw) => {
+        const archiveKey = `${archiveBase}/decays.json`;
+        await putArchive(env.ARCHIVE, archiveKey, raw, "application/json");
+        const data = JSON.parse(raw) as Array<Record<string, unknown>>;
+        return { archiveKey, value: data.slice(0, 20).map((item): Decay => ({
           id: finiteNumber(item.NORAD_CAT_ID),
           name: String(item.OBJECT_NAME ?? "UNKNOWN"),
           epoch: String(item.EPOCH ?? new Date(startedAt).toISOString()),
           meanMotion: finiteNumber(item.MEAN_MOTION),
           bstar: finiteNumber(item.BSTAR),
-        }));
+        })) };
       }),
-      fetchText(KP, "application/json").then((text) => currentKp(JSON.parse(text))),
+      fetchText(KP, "application/json").then(async (raw) => {
+        const archiveKey = `${archiveBase}/space-weather.json`;
+        await putArchive(env.ARCHIVE, archiveKey, raw, "application/json");
+        return { archiveKey, value: currentKp(JSON.parse(raw)) };
+      }),
     ]);
 
-    let conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
-    let decays = decayResult.status === "fulfilled" ? decayResult.value : [];
-    let spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
+    let conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value.value : [];
+    let decays = decayResult.status === "fulfilled" ? decayResult.value.value : [];
+    let spaceWeather = kpResult.status === "fulfilled" ? kpResult.value.value : null;
+    const rawArchiveKeys: Record<string, string> = {};
+    if (conjunctionResult.status === "fulfilled") rawArchiveKeys.conjunctions = conjunctionResult.value.archiveKey;
+    if (decayResult.status === "fulfilled") rawArchiveKeys.decays = decayResult.value.archiveKey;
+    if (kpResult.status === "fulfilled") rawArchiveKeys.spaceWeather = kpResult.value.archiveKey;
     const reason = (result: PromiseSettledResult<unknown>, fallback: string) => result.status === "rejected"
       ? result.reason instanceof Error ? result.reason.message : String(result.reason)
       : fallback;
@@ -363,6 +423,26 @@ async function ingestSignals(env: Env) {
     if (!conjunctions.length || !decays.length) {
       try {
         const proxy = await fetchUpstreamProxy(env);
+        const relayArchiveKey = `${archiveBase}/relay-response.json`;
+        await putArchive(env.ARCHIVE, relayArchiveKey, proxy.relayResponse, "application/json");
+        rawArchiveKeys.relay = relayArchiveKey;
+        const proxyRawArchives: Array<Promise<void>> = [];
+        if (!rawArchiveKeys.conjunctions && proxy.rawSources.conjunctions) {
+          const key = `${archiveBase}/socrates.html`;
+          rawArchiveKeys.conjunctions = key;
+          proxyRawArchives.push(putArchive(env.ARCHIVE, key, proxy.rawSources.conjunctions, "text/html"));
+        }
+        if (!rawArchiveKeys.decays && proxy.rawSources.decays) {
+          const key = `${archiveBase}/decays.json`;
+          rawArchiveKeys.decays = key;
+          proxyRawArchives.push(putArchive(env.ARCHIVE, key, proxy.rawSources.decays, "application/json"));
+        }
+        if (!rawArchiveKeys.spaceWeather && proxy.rawSources.spaceWeather) {
+          const key = `${archiveBase}/space-weather.json`;
+          rawArchiveKeys.spaceWeather = key;
+          proxyRawArchives.push(putArchive(env.ARCHIVE, key, proxy.rawSources.spaceWeather, "application/json"));
+        }
+        await Promise.all(proxyRawArchives);
         if (!conjunctions.length && proxy.conjunctions.length) {
           conjunctions = proxy.conjunctions.slice(0, 12);
           conjunctionSource = "CelesTrak SOCRATES Plus via protected Vercel relay";
@@ -441,8 +521,7 @@ async function ingestSignals(env: Env) {
     statements.push(env.DB.prepare("DELETE FROM space_weather WHERE observed_at < ?").bind(cutoff));
     await env.DB.batch(statements);
 
-    const parts = utcParts(startedAt);
-    const archiveKey = `signals/${parts.path}/${parts.time}.json`;
+    const archiveKey = `${archiveBase}/snapshot.json`;
     const payload = {
       status: failures.length ? "partial" : "live",
       fetchedAt: new Date(startedAt).toISOString(),
@@ -451,6 +530,7 @@ async function ingestSignals(env: Env) {
       spaceWeather,
       failures,
       warnings,
+      rawArchiveKeys,
       sources: {
         conjunctions: conjunctionSource,
         decays: decaySource,
@@ -466,6 +546,7 @@ async function ingestSignals(env: Env) {
       archiveKey,
       failures.length ? failures.join("; ").slice(0, 1000) : null,
     );
+    await pruneRuns(env.DB, startedAt);
     return { runId, archiveKey, ...payload };
   } catch (error) {
     await failRun(env.DB, runId, error);
@@ -535,6 +616,7 @@ async function ingestCatalog(env: Env, force = false) {
     const archiveKey = `catalog/${parts.path}/active.csv`;
     await putArchive(env.ARCHIVE, archiveKey, csv, "text/csv");
     await upsertCatalog(env.DB, objects, startedAt);
+    await env.DB.prepare("DELETE FROM satellites WHERE ingested_at < ?").bind(startedAt).run();
     await env.DB.prepare(`
       INSERT INTO catalog_snapshots (snapshot_date, fetched_at, object_count, archive_key, source)
       VALUES (?, ?, ?, ?, ?)
@@ -545,6 +627,7 @@ async function ingestCatalog(env: Env, force = false) {
         source = excluded.source
     `).bind(parts.date, startedAt, objects.length, archiveKey, source).run();
     await completeRun(env.DB, runId, Date.now(), objects.length, archiveKey);
+    await pruneRuns(env.DB, startedAt);
     return { runId, archiveKey, count: objects.length, source, fetchedAt: new Date(startedAt).toISOString() };
   } catch (error) {
     await failRun(env.DB, runId, error);
@@ -553,6 +636,7 @@ async function ingestCatalog(env: Env, force = false) {
 }
 
 async function latestSignals(db: D1Database) {
+  const freshnessCutoff = Date.now() - 6 * 60 * 60 * 1000;
   const [conjunctionResult, decayResult, weatherResult, runResult] = await db.batch([
     db.prepare(`
       SELECT
@@ -562,22 +646,25 @@ async function latestSignals(db: D1Database) {
         max_probability AS maxProbability, dilution_km AS dilutionKm,
         last_seen_at AS lastSeenAt
       FROM conjunction_events
+      WHERE last_seen_at >= ?
       ORDER BY last_seen_at DESC, range_km ASC
       LIMIT 12
-    `),
+    `).bind(freshnessCutoff),
     db.prepare(`
       SELECT norad_id AS id, object_name AS name, epoch, mean_motion AS meanMotion, bstar,
         last_seen_at AS lastSeenAt
       FROM decay_events
+      WHERE last_seen_at >= ?
       ORDER BY last_seen_at DESC, epoch DESC
       LIMIT 20
-    `),
+    `).bind(freshnessCutoff),
     db.prepare(`
       SELECT observed_at AS time, kp, level, ingested_at AS ingestedAt
       FROM space_weather
+      WHERE ingested_at >= ?
       ORDER BY observed_at DESC
       LIMIT 1
-    `),
+    `).bind(freshnessCutoff),
     db.prepare(`
       SELECT completed_at AS completedAt
       FROM ingestion_runs
@@ -618,7 +705,6 @@ async function latestSignals(db: D1Database) {
   const conjunctionSeenAt = Math.max(0, ...conjunctionRows.map((row) => Number(row.lastSeenAt) || 0));
   const decaySeenAt = Math.max(0, ...decayRows.map((row) => Number(row.lastSeenAt) || 0));
   const weatherSeenAt = Number(weatherRow?.ingestedAt) || 0;
-  const freshnessCutoff = Date.now() - 6 * 60 * 60 * 1000;
   const freshness = {
     conjunctions: conjunctionSeenAt >= freshnessCutoff,
     decays: decaySeenAt >= freshnessCutoff,
@@ -696,11 +782,11 @@ async function handleFetch(request: Request, env: Env) {
     const statement = query
       ? env.DB.prepare(`
           SELECT norad_id AS noradId, object_name AS objectName, object_id AS objectId, epoch, orbital_elements AS orbitalElements
-          FROM satellites WHERE object_name LIKE ? ESCAPE '\\' ORDER BY object_name LIMIT ?
+          FROM satellites WHERE object_name LIKE ? ESCAPE '\\' ORDER BY object_name COLLATE NOCASE LIMIT ?
         `).bind(`%${query.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`, limit)
       : env.DB.prepare(`
           SELECT norad_id AS noradId, object_name AS objectName, object_id AS objectId, epoch, orbital_elements AS orbitalElements
-          FROM satellites ORDER BY object_name LIMIT ?
+          FROM satellites ORDER BY object_name COLLATE NOCASE LIMIT ?
         `).bind(limit);
     const result = await statement.all();
     return jsonResponse(request, env, {

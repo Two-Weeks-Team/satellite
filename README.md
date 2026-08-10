@@ -76,6 +76,8 @@ The frontend reads recent complete signal snapshots from `https://satellite-api.
 
 When CelesTrak rejects a Worker-origin request, the Worker retries those feeds through a token-protected Vercel upstream relay. Configure the same secret as `SATELLITE_UPSTREAM_PROXY_TOKEN` in Vercel and `UPSTREAM_PROXY_TOKEN` in the Worker; neither value belongs in the repository.
 
+Set `SATELLITE_DATA_API_URL=https://satellite-api.agentba.se` in Vercel so the application reads stored snapshots. `INGESTION_TOKEN` is an optional Worker secret for temporary server-to-server maintenance calls; leave it unset to keep manual ingestion disabled. Raw source responses and a derived snapshot are archived under each signal run's R2 prefix.
+
 Cloudflare deployment and migration commands use the `cloudflare/wrangler.jsonc` configuration so they do not collide with the retained Sites build:
 
 ```bash
