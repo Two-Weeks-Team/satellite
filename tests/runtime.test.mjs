@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -8,10 +9,11 @@ const projectRoot = new URL("../", import.meta.url);
 const host = "127.0.0.1";
 let baseUrl;
 let server;
+let dataApiStub;
 let serverOutput = "";
 
 async function availablePort() {
-  const probe = createServer();
+  const probe = createTcpServer();
   probe.listen(0, host);
   await once(probe, "listening");
   const address = probe.address();
@@ -40,6 +42,35 @@ async function waitForServer(url) {
 }
 
 test.before(async () => {
+  const dataApiPort = await availablePort();
+  const dataApiUrl = `http://${host}:${dataApiPort}`;
+  const compactItem = ["ISS (ZARYA)", 25544, "1998-067A", "2026-08-10T12:00:00.000Z", 15.5, 0.0004, 51.6, 120, 30, 45, 0, "U", 999, 12345, 0.0001, 0, 0];
+  dataApiStub = createHttpServer((request, response) => {
+    const pathname = new URL(request.url ?? "/", dataApiUrl).pathname;
+    const fetchedAt = new Date().toISOString();
+    let payload;
+    if (pathname === "/api/catalog/snapshot") {
+      payload = { status: "live", source: "Test catalog via Cloudflare R2", fetchedAt, count: 1, items: [compactItem] };
+    } else if (pathname === "/api/signals") {
+      payload = {
+        status: "live",
+        fetchedAt,
+        conjunctions: [{ id1: 25544, name1: "ISS (ZARYA)", id2: 20580, name2: "HST", tca: fetchedAt, rangeKm: 1, relativeSpeed: 7.5, maxProbability: 0.01, dilutionKm: 0 }],
+        decays: [{ id: 12345, name: "TEST OBJECT", epoch: fetchedAt, meanMotion: 16, bstar: 0.001 }],
+        spaceWeather: { time: fetchedAt, kp: 2, level: "quiet" },
+        sources: { conjunctions: "Test D1", decays: "Test D1", spaceWeather: "Test D1" },
+      };
+    } else {
+      response.writeHead(404).end();
+      return;
+    }
+    const body = JSON.stringify(payload);
+    response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+    response.end(body);
+  });
+  dataApiStub.listen(dataApiPort, host);
+  await once(dataApiStub, "listening");
+
   const port = await availablePort();
   baseUrl = `http://${host}:${port}`;
   server = spawn(
@@ -47,7 +78,12 @@ test.before(async () => {
     ["node_modules/next/dist/bin/next", "start", "--hostname", host, "--port", String(port)],
     {
       cwd: projectRoot,
-      env: { ...process.env, NODE_ENV: "production" },
+      env: {
+        ...process.env,
+        NODE_ENV: "production",
+        SATELLITE_DATA_API_URL: dataApiUrl,
+        SATELLITE_UPSTREAM_PROXY_TOKEN: "runtime-test-proxy-token",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -57,12 +93,17 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  if (!server || server.exitCode !== null) return;
-  server.kill("SIGTERM");
-  await Promise.race([
-    once(server, "exit"),
-    new Promise((resolve) => setTimeout(resolve, 5_000)),
-  ]);
+  if (server && server.exitCode === null) {
+    server.kill("SIGTERM");
+    await Promise.race([
+      once(server, "exit"),
+      new Promise((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+  }
+  if (dataApiStub) {
+    dataApiStub.close();
+    await once(dataApiStub, "close");
+  }
 });
 
 test("serves the production application", async () => {
@@ -82,6 +123,7 @@ test("serves live-or-fallback catalog data within Vercel's payload limit", async
   assert.ok(["live", "cached-sample"].includes(catalog.status));
   assert.equal(catalog.count, catalog.items.length);
   assert.ok(catalog.count > 0);
+  assert.match(catalog.source, /Cloudflare R2/);
   assert.ok(bytes.byteLength < 4_500_000, `catalog payload was ${bytes.byteLength} bytes`);
 });
 
@@ -94,7 +136,8 @@ test("serves signal, agent, and binary orbit APIs", async () => {
 
   assert.equal(signalsResponse.status, 200);
   const signals = await signalsResponse.json();
-  assert.ok(["live", "partial", "offline"].includes(signals.status));
+  assert.equal(signals.status, "live");
+  assert.equal(signals.sources.conjunctions, "Test D1");
 
   assert.equal(agentResponse.status, 200);
   const agent = await agentResponse.json();
@@ -108,4 +151,11 @@ test("serves signal, agent, and binary orbit APIs", async () => {
   const orbitBytes = await orbitResponse.arrayBuffer();
   assert.ok(orbitCount > 0);
   assert.equal(orbitBytes.byteLength, 48 + orbitCount * 56);
+});
+
+test("rejects unauthorized access to the protected upstream relay", async () => {
+  const response = await fetch(`${baseUrl}/api/signals?upstream=1`, { signal: AbortSignal.timeout(10_000) });
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "Unauthorized" });
+  assert.equal(response.headers.get("cache-control"), "no-store");
 });

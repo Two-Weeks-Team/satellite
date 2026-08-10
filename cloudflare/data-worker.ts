@@ -1,14 +1,14 @@
 /// <reference types="@cloudflare/workers-types" />
 
-interface Env {
-  DB: D1Database;
-  ARCHIVE: R2Bucket;
-  ENVIRONMENT: "preview" | "production";
-  ALLOWED_ORIGINS: string;
+import type { CompactOmm, StoredCatalogSnapshot } from "../lib/catalog-snapshot";
+import { readTextWithinLimit } from "../lib/read-response";
+
+type WorkerSecrets = {
   INGESTION_TOKEN?: string;
-  UPSTREAM_PROXY_URL?: string;
   UPSTREAM_PROXY_TOKEN?: string;
-}
+};
+
+type WorkerEnv = Env & WorkerSecrets;
 
 type IngestionScope = "signals" | "catalog";
 
@@ -68,8 +68,12 @@ const CATALOG_SOURCES = [
 ] as const;
 const SOURCE_TIMEOUT_MS = 20_000;
 const HISTORY_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+const MAX_SIGNAL_SOURCE_BYTES = 2_000_000;
+const MAX_CATALOG_SOURCE_BYTES = 10_000_000;
+const MAX_RELAY_BYTES = 12_000_000;
+const CATALOG_FRESHNESS_MS = 36 * 60 * 60 * 1000;
 
-function jsonResponse(request: Request, env: Env, value: unknown, status = 200) {
+function jsonResponse(request: Request, env: WorkerEnv, value: unknown, status = 200) {
   const headers = new Headers({
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": status >= 400 ? "no-store" : "public, max-age=30",
@@ -84,7 +88,7 @@ function jsonResponse(request: Request, env: Env, value: unknown, status = 200) 
   return Response.json(value, { status, headers });
 }
 
-function optionsResponse(request: Request, env: Env) {
+function optionsResponse(request: Request, env: WorkerEnv) {
   const origin = request.headers.get("Origin");
   const allowed = env.ALLOWED_ORIGINS.split(",").map((item) => item.trim()).filter(Boolean);
   if (!origin || !allowed.includes(origin)) return new Response(null, { status: 403 });
@@ -100,7 +104,7 @@ function optionsResponse(request: Request, env: Env) {
   });
 }
 
-async function fetchText(url: string, accept: string) {
+async function fetchText(url: string, accept: string, maxBytes = MAX_SIGNAL_SOURCE_BYTES) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
   try {
@@ -112,13 +116,13 @@ async function fetchText(url: string, accept: string) {
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`${new URL(url).hostname} responded ${response.status}`);
-    return await response.text();
+    return await readTextWithinLimit(response, maxBytes);
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function fetchUpstreamProxy(env: Env) {
+async function fetchUpstreamProxy(env: WorkerEnv) {
   const url = env.UPSTREAM_PROXY_URL?.trim();
   const token = env.UPSTREAM_PROXY_TOKEN?.trim();
   if (!url || !token) throw new Error("Upstream proxy is not configured");
@@ -133,7 +137,7 @@ async function fetchUpstreamProxy(env: Env) {
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`Upstream proxy responded ${response.status}`);
-    const relayResponse = await response.text();
+    const relayResponse = await readTextWithinLimit(response, MAX_RELAY_BYTES);
     const value = JSON.parse(relayResponse) as {
       conjunctions?: unknown[];
       decays?: unknown[];
@@ -251,6 +255,26 @@ function currentKp(rows: unknown): SpaceWeather | null {
   };
 }
 
+function parseDecays(raw: string) {
+  const value: unknown = JSON.parse(raw);
+  if (!Array.isArray(value)) throw new Error("Decay source returned an invalid payload");
+  const decays: Decay[] = [];
+  for (const item of value.slice(0, 20)) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const decay = {
+      id: finiteNumber(record.NORAD_CAT_ID, -1),
+      name: String(record.OBJECT_NAME ?? "").trim(),
+      epoch: String(record.EPOCH ?? ""),
+      meanMotion: finiteNumber(record.MEAN_MOTION, -1),
+      bstar: finiteNumber(record.BSTAR),
+    };
+    if (decay.id < 0 || !decay.name || !Number.isFinite(Date.parse(decay.epoch)) || decay.meanMotion <= 0) continue;
+    decays.push(decay);
+  }
+  return decays;
+}
+
 function parseCsv(input: string) {
   const rows: string[][] = [];
   let row: string[] = [];
@@ -326,6 +350,29 @@ function parseCatalog(csv: string) {
   return objects;
 }
 
+function compactCatalogObject(item: CatalogObject): CompactOmm {
+  const orbital = JSON.parse(item.orbitalElements) as Record<string, unknown>;
+  return [
+    item.objectName,
+    item.noradId,
+    item.objectId,
+    new Date(item.epoch).toISOString(),
+    finiteNumber(orbital.meanMotion),
+    finiteNumber(orbital.eccentricity),
+    finiteNumber(orbital.inclination),
+    finiteNumber(orbital.raan),
+    finiteNumber(orbital.argumentOfPericenter),
+    finiteNumber(orbital.meanAnomaly),
+    0,
+    String(orbital.classification) === "C" ? "C" : "U",
+    finiteNumber(orbital.elementSetNumber),
+    finiteNumber(orbital.revolutionAtEpoch),
+    finiteNumber(orbital.bstar),
+    finiteNumber(orbital.meanMotionDot),
+    finiteNumber(orbital.meanMotionDdot),
+  ];
+}
+
 function utcParts(timestamp: number) {
   const iso = new Date(timestamp).toISOString();
   return {
@@ -376,7 +423,7 @@ async function pruneRuns(db: D1Database, now: number) {
     .run();
 }
 
-async function ingestSignals(env: Env) {
+async function ingestSignals(env: WorkerEnv) {
   const startedAt = Date.now();
   const parts = utcParts(startedAt);
   const archiveBase = `signals/${parts.path}/${parts.time}`;
@@ -391,14 +438,7 @@ async function ingestSignals(env: Env) {
       fetchText(DECAYING, "application/json").then(async (raw) => {
         const archiveKey = `${archiveBase}/decays.json`;
         await putArchive(env.ARCHIVE, archiveKey, raw, "application/json");
-        const data = JSON.parse(raw) as Array<Record<string, unknown>>;
-        return { archiveKey, value: data.slice(0, 20).map((item): Decay => ({
-          id: finiteNumber(item.NORAD_CAT_ID),
-          name: String(item.OBJECT_NAME ?? "UNKNOWN"),
-          epoch: String(item.EPOCH ?? new Date(startedAt).toISOString()),
-          meanMotion: finiteNumber(item.MEAN_MOTION),
-          bstar: finiteNumber(item.BSTAR),
-        })) };
+        return { archiveKey, value: parseDecays(raw) };
       }),
       fetchText(KP, "application/json").then(async (raw) => {
         const archiveKey = `${archiveBase}/space-weather.json`;
@@ -559,7 +599,7 @@ async function fetchCatalogCsv() {
   const failures: string[] = [];
   for (const source of CATALOG_SOURCES) {
     try {
-      const csv = await fetchText(source.url, "text/csv");
+      const csv = await fetchText(source.url, "text/csv", MAX_CATALOG_SOURCE_BYTES);
       const objects = parseCatalog(csv);
       return { csv, objects, source: source.label };
     } catch (error) {
@@ -576,15 +616,16 @@ async function upsertCatalog(db: D1Database, objects: CatalogObject[], ingestedA
     await db.batch(statements.splice(0));
   };
 
-  for (let offset = 0; offset < objects.length; offset += 20) {
-    const group = objects.slice(offset, offset + 20);
-    const placeholders = group.map(() => `(?, ?, ?, ?, ?, ${ingestedAt})`).join(", ");
+  for (let offset = 0; offset < objects.length; offset += 16) {
+    const group = objects.slice(offset, offset + 16);
+    const placeholders = group.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
     const values = group.flatMap((item) => [
       item.noradId,
       item.objectName,
       item.objectId,
       item.epoch,
       item.orbitalElements,
+      ingestedAt,
     ]);
     statements.push(db.prepare(`
       INSERT INTO satellites (norad_id, object_name, object_id, epoch, orbital_elements, ingested_at)
@@ -601,7 +642,7 @@ async function upsertCatalog(db: D1Database, objects: CatalogObject[], ingestedA
   await flush();
 }
 
-async function ingestCatalog(env: Env, force = false) {
+async function ingestCatalog(env: WorkerEnv, force = false) {
   const startedAt = Date.now();
   const parts = utcParts(startedAt);
   if (!force) {
@@ -615,7 +656,18 @@ async function ingestCatalog(env: Env, force = false) {
   try {
     const { csv, objects, source } = await fetchCatalogCsv();
     const archiveKey = `catalog/${parts.path}/active.csv`;
-    await putArchive(env.ARCHIVE, archiveKey, csv, "text/csv");
+    const compactArchiveKey = `catalog/${parts.path}/active.compact.json`;
+    const compactSnapshot: StoredCatalogSnapshot = {
+      status: "live",
+      source: `${source} via Cloudflare R2`,
+      fetchedAt: new Date(startedAt).toISOString(),
+      count: objects.length,
+      items: objects.map(compactCatalogObject),
+    };
+    await Promise.all([
+      putArchive(env.ARCHIVE, archiveKey, csv, "text/csv"),
+      putArchive(env.ARCHIVE, compactArchiveKey, JSON.stringify(compactSnapshot), "application/json"),
+    ]);
     await upsertCatalog(env.DB, objects, startedAt);
     await env.DB.prepare("DELETE FROM satellites WHERE ingested_at < ?").bind(startedAt).run();
     await env.DB.prepare(`
@@ -629,7 +681,7 @@ async function ingestCatalog(env: Env, force = false) {
     `).bind(parts.date, startedAt, objects.length, archiveKey, source).run();
     await completeRun(env.DB, runId, Date.now(), objects.length, archiveKey);
     await pruneRuns(env.DB, startedAt);
-    return { runId, archiveKey, count: objects.length, source, fetchedAt: new Date(startedAt).toISOString() };
+    return { runId, archiveKey, compactArchiveKey, count: objects.length, source, fetchedAt: new Date(startedAt).toISOString() };
   } catch (error) {
     await failRun(env.DB, runId, error);
     throw error;
@@ -728,53 +780,142 @@ async function latestSignals(db: D1Database) {
   };
 }
 
+async function catalogSnapshotResponse(request: Request, env: WorkerEnv) {
+  const snapshot = await env.DB.prepare(`
+    SELECT fetched_at AS fetchedAt, object_count AS objectCount, archive_key AS archiveKey, source
+    FROM catalog_snapshots
+    ORDER BY fetched_at DESC
+    LIMIT 1
+  `).first<Record<string, unknown>>();
+  if (!snapshot) return jsonResponse(request, env, { error: "Catalog snapshot unavailable" }, 404);
+
+  const archiveKey = String(snapshot.archiveKey);
+  const compactArchiveKey = archiveKey.endsWith("/active.csv")
+    ? archiveKey.replace(/\/active\.csv$/, "/active.compact.json")
+    : `${archiveKey}.compact.json`;
+  const object = await env.ARCHIVE.get(compactArchiveKey);
+  if (!object) return jsonResponse(request, env, { error: "Compact catalog snapshot unavailable" }, 404);
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Content-Length", String(object.size));
+  headers.set("Cache-Control", "public, max-age=120, stale-while-revalidate=300");
+  headers.set("ETag", object.httpEtag);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Catalog-Fetched-At", new Date(Number(snapshot.fetchedAt)).toISOString());
+  headers.set("X-Catalog-Object-Count", String(snapshot.objectCount));
+  const origin = request.headers.get("Origin");
+  const allowed = env.ALLOWED_ORIGINS.split(",").map((item) => item.trim()).filter(Boolean);
+  if (origin && allowed.includes(origin)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Vary", "Origin");
+  }
+  return new Response(object.body, { headers });
+}
+
 async function health(db: D1Database) {
-  const [satellites, conjunctions, decays, weather, failedRuns, partialRuns] = await db.batch([
+  const now = Date.now();
+  const [satellites, conjunctions, decays, weather, failedRuns, partialRuns, latestSignalRun, latestCatalog] = await db.batch([
     db.prepare("SELECT COUNT(*) AS count FROM satellites"),
     db.prepare("SELECT COUNT(*) AS count FROM conjunction_events"),
     db.prepare("SELECT COUNT(*) AS count FROM decay_events"),
     db.prepare("SELECT COUNT(*) AS count FROM space_weather"),
-    db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'failed' AND started_at > ?").bind(Date.now() - 24 * 60 * 60 * 1000),
-    db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'completed' AND error_message IS NOT NULL AND started_at > ?").bind(Date.now() - 24 * 60 * 60 * 1000),
+    db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'failed' AND started_at > ?").bind(now - 24 * 60 * 60 * 1000),
+    db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'completed' AND error_message IS NOT NULL AND started_at > ?").bind(now - 24 * 60 * 60 * 1000),
+    db.prepare(`
+      SELECT status, started_at AS startedAt, completed_at AS completedAt,
+        item_count AS itemCount, error_message AS errorMessage
+      FROM ingestion_runs
+      WHERE scope = 'signals'
+      ORDER BY started_at DESC
+      LIMIT 1
+    `),
+    db.prepare(`
+      SELECT snapshot_date AS snapshotDate, fetched_at AS fetchedAt,
+        object_count AS objectCount, archive_key AS archiveKey, source
+      FROM catalog_snapshots
+      ORDER BY fetched_at DESC
+      LIMIT 1
+    `),
   ]);
   const count = (result: D1Result<unknown>) => {
     const row = result.results[0] as Record<string, unknown> | undefined;
     return Number(row?.count ?? 0);
   };
+  const first = (result: D1Result<unknown>) => result.results[0] as Record<string, unknown> | undefined;
+  const signalRun = first(latestSignalRun) ?? null;
+  const catalog = first(latestCatalog) ?? null;
+  const catalogFetchedAt = Number(catalog?.fetchedAt) || 0;
   return {
-    satellites: count(satellites),
-    conjunctions: count(conjunctions),
-    decays: count(decays),
-    spaceWeather: count(weather),
-    failedRunsLast24h: count(failedRuns),
-    partialRunsLast24h: count(partialRuns),
+    database: {
+      satellites: count(satellites),
+      conjunctions: count(conjunctions),
+      decays: count(decays),
+      spaceWeather: count(weather),
+    },
+    incidents: {
+      failedRunsLast24h: count(failedRuns),
+      partialRunsLast24h: count(partialRuns),
+    },
+    latestSignalRun: signalRun,
+    latestCatalog: catalog,
+    catalogFresh: catalogFetchedAt > 0 && now - catalogFetchedAt <= CATALOG_FRESHNESS_MS,
   };
 }
 
-function validManualRequest(request: Request, env: Env) {
+async function validManualRequest(request: Request, env: WorkerEnv) {
   if (!env.INGESTION_TOKEN) return false;
   const expected = env.INGESTION_TOKEN.trim();
-  const directToken = request.headers.get("X-Ingestion-Token");
-  const authorization = request.headers.get("Authorization");
-  return directToken === expected || authorization === `Bearer ${expected}`;
+  const encoder = new TextEncoder();
+  const compare = async (provided: string | null, target: string) => {
+    const [providedHash, targetHash] = await Promise.all([
+      crypto.subtle.digest("SHA-256", encoder.encode(provided ?? "")),
+      crypto.subtle.digest("SHA-256", encoder.encode(target)),
+    ]);
+    const subtle = crypto.subtle as SubtleCrypto & {
+      timingSafeEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBufferView): boolean;
+    };
+    return subtle.timingSafeEqual(providedHash, targetHash);
+  };
+  const [directMatch, authorizationMatch] = await Promise.all([
+    compare(request.headers.get("X-Ingestion-Token"), expected),
+    compare(request.headers.get("Authorization"), `Bearer ${expected}`),
+  ]);
+  return directMatch || authorizationMatch;
 }
 
-async function handleFetch(request: Request, env: Env) {
+async function handleFetch(request: Request, env: WorkerEnv) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return optionsResponse(request, env);
 
   if (request.method === "GET" && url.pathname === "/health") {
-    const counts = await health(env.DB);
+    const [state, signals] = await Promise.all([health(env.DB), latestSignals(env.DB)]);
+    const latestRun = state.latestSignalRun;
+    const latestSignalRunClean = latestRun?.status === "completed" && latestRun.errorMessage == null;
     return jsonResponse(request, env, {
-      status: counts.failedRunsLast24h || counts.partialRunsLast24h ? "degraded" : "ok",
+      status: signals.status === "live" && state.catalogFresh && latestSignalRunClean ? "ok" : "degraded",
       environment: env.ENVIRONMENT,
-      database: counts,
+      database: state.database,
+      freshness: {
+        signals: signals.freshness,
+        catalog: state.catalogFresh,
+      },
+      latestRuns: {
+        signals: state.latestSignalRun,
+        catalog: state.latestCatalog,
+      },
+      incidents: state.incidents,
       checkedAt: new Date().toISOString(),
     });
   }
 
   if (request.method === "GET" && url.pathname === "/api/signals") {
     return jsonResponse(request, env, await latestSignals(env.DB));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/catalog/snapshot") {
+    return catalogSnapshotResponse(request, env);
   }
 
   if (request.method === "GET" && url.pathname === "/api/catalog/latest") {
@@ -801,7 +942,7 @@ async function handleFetch(request: Request, env: Env) {
   }
 
   if (request.method === "POST" && url.pathname === "/internal/ingest") {
-    if (!validManualRequest(request, env)) return jsonResponse(request, env, { error: "Unauthorized" }, 401);
+    if (!await validManualRequest(request, env)) return jsonResponse(request, env, { error: "Unauthorized" }, 401);
     const scope = url.searchParams.get("scope") as IngestionScope | null;
     if (scope === "signals") return jsonResponse(request, env, await ingestSignals(env));
     if (scope === "catalog") return jsonResponse(request, env, await ingestCatalog(env, url.searchParams.get("force") === "true"));
@@ -811,12 +952,39 @@ async function handleFetch(request: Request, env: Env) {
   return jsonResponse(request, env, { error: "Not found" }, 404);
 }
 
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function ingestionLogFields(result: unknown) {
+  if (!result || typeof result !== "object") return {};
+  const value = result as Record<string, unknown>;
+  return {
+    runId: value.runId,
+    archiveKey: value.archiveKey,
+    status: value.status,
+    itemCount: value.count ?? (
+      (Array.isArray(value.conjunctions) ? value.conjunctions.length : 0)
+      + (Array.isArray(value.decays) ? value.decays.length : 0)
+      + (value.spaceWeather ? 1 : 0)
+    ),
+    warningCount: Array.isArray(value.warnings) ? value.warnings.length : 0,
+    failureCount: Array.isArray(value.failures) ? value.failures.length : 0,
+  };
+}
+
 export default {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: WorkerEnv) {
     try {
       return await handleFetch(request, env);
     } catch (error) {
-      console.error("request failed", error);
+      const url = new URL(request.url);
+      console.error(JSON.stringify({
+        message: "request failed",
+        method: request.method,
+        path: url.pathname,
+        error: errorMessage(error),
+      }));
       return jsonResponse(request, env, {
         error: "Internal server error",
         requestId: crypto.randomUUID(),
@@ -824,11 +992,22 @@ export default {
     }
   },
 
-  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    const task = controller.cron === "0 18 * * *" ? ingestCatalog(env) : ingestSignals(env);
+  async scheduled(controller: ScheduledController, env: WorkerEnv, ctx: ExecutionContext) {
+    const scope = controller.cron === "0 18 * * *" ? "catalog" : "signals";
+    const task = scope === "catalog" ? ingestCatalog(env) : ingestSignals(env);
     ctx.waitUntil(task.then(
-      (result) => console.log("scheduled ingestion completed", { cron: controller.cron, result }),
-      (error) => console.error("scheduled ingestion failed", { cron: controller.cron, error }),
+      (result) => console.log(JSON.stringify({
+        message: "scheduled ingestion completed",
+        cron: controller.cron,
+        scope,
+        ...ingestionLogFields(result),
+      })),
+      (error) => console.error(JSON.stringify({
+        message: "scheduled ingestion failed",
+        cron: controller.cron,
+        scope,
+        error: errorMessage(error),
+      })),
     ));
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<WorkerEnv>;

@@ -1,28 +1,15 @@
-type UpstreamOmm = Record<string, string | number | null>;
+import { isStoredCatalogSnapshot, type CompactOmm } from "@/lib/catalog-snapshot";
+import { readTextWithinLimit } from "@/lib/read-response";
 
-export type CompactOmm = [
-  string,
-  number,
-  string,
-  string,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  "U" | "C",
-  number,
-  number,
-  number,
-  number,
-  number,
-];
+type UpstreamOmm = Record<string, string | number | null>;
+export type { CompactOmm } from "@/lib/catalog-snapshot";
 
 const TWO_HOURS = 60 * 60 * 2;
 const FAILURE_CACHE_SECONDS = 30;
 const SOURCE_TIMEOUT_MS = 4_000;
+const MAX_CATALOG_BYTES = 10_000_000;
+const MAX_STORED_CATALOG_BYTES = 4_400_000;
+const MAX_STORED_CATALOG_AGE_MS = 36 * 60 * 60 * 1000;
 const sources = [
   {
     url: "https://retlector.eu/csv/active",
@@ -127,7 +114,7 @@ async function fetchCatalogSource(source: (typeof sources)[number]) {
       next: { revalidate: TWO_HOURS },
     } as RequestInit & { next: { revalidate: number } });
     if (!response.ok) throw new Error(`${source.label} responded ${response.status}`);
-    const csv = await response.text();
+    const csv = await readTextWithinLimit(response, MAX_CATALOG_BYTES);
     const [header = [], ...rows] = parseCsv(csv);
     const items = rows
       .map((row) => Object.fromEntries(header.map((key, index) => [key.trim(), row[index] ?? ""])))
@@ -153,19 +140,46 @@ async function fetchCatalog() {
 }
 
 type CatalogResult =
-  | { status: "live"; source: string; fetchedAt: string; count: number; items: CompactOmm[] }
+  | { status: "live"; source: string; fetchedAt: string; cachedAt?: string; count: number; items: CompactOmm[] }
   | { status: "cached-sample"; source: string; fetchedAt: string; count: number; items: CompactOmm[]; message: string };
 
 let catalogCache: CatalogResult | null = null;
 let catalogPromise: Promise<CatalogResult> | null = null;
 
 function cacheIsFresh(catalog: CatalogResult) {
-  const age = Date.now() - Date.parse(catalog.fetchedAt);
+  const age = Date.now() - Date.parse("cachedAt" in catalog && catalog.cachedAt ? catalog.cachedAt : catalog.fetchedAt);
   const maxAge = (catalog.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS) * 1000;
   return Number.isFinite(age) && age >= 0 && age < maxAge;
 }
 
+async function loadStoredCatalog(): Promise<CatalogResult | null> {
+  const baseUrl = process.env.SATELLITE_DATA_API_URL?.replace(/\/$/, "");
+  if (!baseUrl) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}/api/catalog/snapshot`, {
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+      next: { revalidate: 120 },
+    } as RequestInit & { next: { revalidate: number } });
+    if (!response.ok) return null;
+    const raw = await readTextWithinLimit(response, MAX_STORED_CATALOG_BYTES);
+    const result: unknown = JSON.parse(raw);
+    if (!isStoredCatalogSnapshot(result)) return null;
+    const age = Date.now() - Date.parse(result.fetchedAt);
+    if (!Number.isFinite(age) || age < 0 || age > MAX_STORED_CATALOG_AGE_MS) return null;
+    return { ...result, cachedAt: new Date().toISOString() };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function loadCatalogOnce(): Promise<CatalogResult> {
+  const stored = await loadStoredCatalog();
+  if (stored) return stored;
   const fetchedAt = new Date().toISOString();
   try {
     const result = await fetchCatalog();
@@ -199,5 +213,7 @@ export async function loadCatalog() {
 export async function GET() {
   const catalog = await loadCatalog();
   const cacheSeconds = catalog.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS;
-  return Response.json(catalog, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
+  const responseBody = { ...catalog } as CatalogResult & { cachedAt?: string };
+  delete responseBody.cachedAt;
+  return Response.json(responseBody, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
 }

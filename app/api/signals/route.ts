@@ -1,3 +1,6 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { readTextWithinLimit } from "@/lib/read-response";
+
 type Conjunction = {
   id1: number;
   name1: string;
@@ -53,6 +56,8 @@ const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
 const TWO_HOURS = 60 * 60 * 2;
 const FAILURE_CACHE_SECONDS = 30;
 const SOURCE_TIMEOUT_MS = 4_000;
+const MAX_SIGNAL_SOURCE_BYTES = 2_000_000;
+const MAX_STORED_SIGNALS_BYTES = 1_000_000;
 
 function cleanHtml(value: string) {
   return value
@@ -107,7 +112,7 @@ function parseConjunctions(html: string) {
 }
 
 function currentKp(rows: unknown): SpaceWeather | null {
-  if (!Array.isArray(rows) || rows.length < 1) return null;
+  if (!Array.isArray(rows) || rows.length < 2) return null;
   const latest = rows[rows.length - 1];
   const record = Array.isArray(latest) && Array.isArray(rows[0])
     ? Object.fromEntries((rows[0] as string[]).map((key, index) => [key, latest[index]]))
@@ -122,7 +127,7 @@ function currentKp(rows: unknown): SpaceWeather | null {
   };
 }
 
-async function cachedFetchText(url: string, accept: string) {
+async function cachedFetchText(url: string, accept: string, maxBytes = MAX_SIGNAL_SOURCE_BYTES) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
   try {
@@ -132,18 +137,50 @@ async function cachedFetchText(url: string, accept: string) {
       next: { revalidate: TWO_HOURS },
     } as RequestInit & { next: { revalidate: number } });
     if (!response.ok) throw new Error(`${new URL(url).hostname} ${response.status}`);
-    return await response.text();
+    return await readTextWithinLimit(response, maxBytes);
   } finally {
     clearTimeout(timeout);
   }
 }
 
+function isConjunction(value: unknown): value is Conjunction {
+  const candidate = value as Partial<Conjunction> | null;
+  return !!candidate && typeof candidate === "object"
+    && Number.isFinite(candidate.id1) && Number.isFinite(candidate.id2)
+    && typeof candidate.name1 === "string" && typeof candidate.name2 === "string"
+    && typeof candidate.tca === "string" && Number.isFinite(Date.parse(candidate.tca))
+    && [candidate.rangeKm, candidate.relativeSpeed, candidate.maxProbability, candidate.dilutionKm]
+      .every((number) => Number.isFinite(number));
+}
+
+function isDecay(value: unknown): value is Decay {
+  const candidate = value as Partial<Decay> | null;
+  return !!candidate && typeof candidate === "object"
+    && Number.isFinite(candidate.id) && typeof candidate.name === "string"
+    && typeof candidate.epoch === "string" && Number.isFinite(Date.parse(candidate.epoch))
+    && Number.isFinite(candidate.meanMotion) && Number.isFinite(candidate.bstar);
+}
+
+function isSpaceWeather(value: unknown): value is SpaceWeather {
+  const candidate = value as Partial<SpaceWeather> | null;
+  return !!candidate && typeof candidate === "object"
+    && typeof candidate.time === "string" && Number.isFinite(Date.parse(candidate.time))
+    && Number.isFinite(candidate.kp)
+    && ["quiet", "active", "storm", "severe"].includes(String(candidate.level));
+}
+
 function isStoredSignals(value: unknown): value is SignalsResult {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<SignalsResult>;
-  return typeof candidate.fetchedAt === "string"
+  return ["live", "partial", "offline"].includes(String(candidate.status))
+    && typeof candidate.fetchedAt === "string"
+    && Number.isFinite(Date.parse(candidate.fetchedAt))
     && Array.isArray(candidate.conjunctions)
+    && candidate.conjunctions.every(isConjunction)
     && Array.isArray(candidate.decays)
+    && candidate.decays.every(isDecay)
+    && (candidate.spaceWeather === null || isSpaceWeather(candidate.spaceWeather))
+    && !!candidate.sources
     && typeof candidate.sources === "object";
 }
 
@@ -159,7 +196,7 @@ async function loadStoredSignals(): Promise<SignalsResult | null> {
       next: { revalidate: 120 },
     } as RequestInit & { next: { revalidate: number } });
     if (!response.ok) return null;
-    const result: unknown = await response.json();
+    const result: unknown = JSON.parse(await readTextWithinLimit(response, MAX_STORED_SIGNALS_BYTES));
     if (!isStoredSignals(result) || result.status !== "live") return null;
     const age = Date.now() - Date.parse(result.fetchedAt);
     if (!Number.isFinite(age) || age < 0 || age > 6 * 60 * 60 * 1000) return null;
@@ -176,14 +213,18 @@ async function loadUpstreamSignals(includeRaw = false): Promise<UpstreamSignalsR
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
     cachedFetchText(SOCRATES, "text/html").then((raw) => ({ raw, value: parseConjunctions(raw) })),
     cachedFetchText(DECAYING, "application/json").then((raw) => {
-      const data = JSON.parse(raw) as Array<Record<string, string | number>>;
-      return { raw, value: data.slice(0, 20).map((item): Decay => ({
-        id: Number(item.NORAD_CAT_ID),
-        name: String(item.OBJECT_NAME),
-        epoch: String(item.EPOCH),
-        meanMotion: Number(item.MEAN_MOTION),
-        bstar: Number(item.BSTAR),
-      })) };
+      const data: unknown = JSON.parse(raw);
+      if (!Array.isArray(data)) throw new Error("Decay source returned an invalid payload");
+      return { raw, value: data.slice(0, 20).map((item): Decay => {
+        const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
+        return {
+          id: Number(record.NORAD_CAT_ID),
+          name: String(record.OBJECT_NAME ?? ""),
+          epoch: String(record.EPOCH ?? ""),
+          meanMotion: Number(record.MEAN_MOTION),
+          bstar: Number(record.BSTAR),
+        };
+      }).filter(isDecay) };
     }),
     cachedFetchText(KP, "application/json").then((raw) => ({ raw, value: currentKp(JSON.parse(raw)) })),
   ]);
@@ -213,6 +254,12 @@ async function loadUpstreamSignals(includeRaw = false): Promise<UpstreamSignalsR
     };
   }
   return result;
+}
+
+function tokenMatches(provided: string | null, expected: string) {
+  const providedHash = createHash("sha256").update(provided ?? "").digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(providedHash, expectedHash);
 }
 
 async function loadSignalsOnce(): Promise<SignalsResult> {
@@ -248,7 +295,7 @@ export async function GET(request: Request) {
   if (url.searchParams.get("upstream") === "1") {
     const expected = process.env.SATELLITE_UPSTREAM_PROXY_TOKEN?.trim();
     const authorization = request.headers.get("Authorization");
-    if (!expected || authorization !== `Bearer ${expected}`) {
+    if (!expected || !tokenMatches(authorization, `Bearer ${expected}`)) {
       return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "Cache-Control": "no-store" } });
     }
     const signals = await loadUpstreamSignals(true);
