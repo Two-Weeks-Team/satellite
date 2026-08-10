@@ -46,7 +46,8 @@ type RawSignalSources = {
 
 type UpstreamSignalsResult = SignalsResult & { rawSources?: RawSignalSources };
 
-const SOCRATES = "https://celestrak.org/SOCRATES-Plus/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
+// The product is named SOCRATES Plus, but CelesTrak serves it from the legacy /SOCRATES/ path.
+const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
 const TWO_HOURS = 60 * 60 * 2;
