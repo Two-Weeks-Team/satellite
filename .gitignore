@@ -41,7 +41,6 @@ next-env.d.ts
 /dist/
 /.wrangler/
 /cloudflare/.wrangler/
-/cloudflare/worker-configuration.d.ts
 /.sites-runtime/
 /outputs/
 /work/

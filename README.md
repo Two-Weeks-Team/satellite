@@ -72,11 +72,13 @@ npm test
 
 The public GitHub repository is connected to the `2weeks-team/satellite` Vercel project. Pushes to `main` automatically create production deployments with the settings in `vercel.json`.
 
-The frontend reads recent complete signal snapshots from `https://satellite-api.agentba.se`. If the stored snapshot is partial, unavailable, or more than six hours old, the Vercel API falls back to the public upstream feeds. Cloudflare Cron refreshes signals every two hours and the active catalog daily; D1 keeps queryable state and R2 retains the raw source payloads.
+The frontend reads recent complete signal snapshots and the latest compact catalog snapshot from `https://satellite-api.agentba.se`. If a signal snapshot is partial, unavailable, or more than six hours old—or the daily catalog snapshot is more than 36 hours old—the Vercel API falls back to the public upstream feeds. Cloudflare Cron refreshes signals every two hours and the active catalog daily; D1 keeps queryable state and run history while R2 retains raw source payloads plus a streamable compact catalog snapshot.
 
 When CelesTrak rejects a Worker-origin request, the Worker retries those feeds through a token-protected Vercel upstream relay. Configure the same secret as `SATELLITE_UPSTREAM_PROXY_TOKEN` in Vercel and `UPSTREAM_PROXY_TOKEN` in the Worker; neither value belongs in the repository.
 
-Set `SATELLITE_DATA_API_URL=https://satellite-api.agentba.se` in Vercel so the application reads stored snapshots. `INGESTION_TOKEN` is an optional Worker secret for temporary server-to-server maintenance calls; leave it unset to keep manual ingestion disabled. Raw source responses and a derived snapshot are archived under each signal run's R2 prefix.
+Set `SATELLITE_DATA_API_URL=https://satellite-api.agentba.se` in Vercel so the application reads stored snapshots. `INGESTION_TOKEN` is an optional Worker secret for temporary server-to-server maintenance calls; leave it unset to keep manual ingestion disabled. Raw signal responses and a derived snapshot are archived under each signal run's R2 prefix; catalog runs archive both `active.csv` and `active.compact.json`.
+
+`GET /health` reports readiness from the latest signal data and catalog freshness. Recent failed or partial runs remain visible under `incidents` for diagnosis but do not keep a recovered service marked degraded.
 
 Cloudflare deployment and migration commands use the `cloudflare/wrangler.jsonc` configuration so they do not collide with the retained Sites build:
 

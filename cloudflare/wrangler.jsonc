@@ -3,7 +3,7 @@
   "name": "satellite-data-api",
   "account_id": "d0d06bd043ebf75c9fd8aba7c458243a",
   "main": "data-worker.ts",
-  "compatibility_date": "2026-08-01",
+  "compatibility_date": "2026-08-10",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": false,
   "routes": [
@@ -14,7 +14,15 @@
   ],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
   },
   "vars": {
     "ENVIRONMENT": "production",
