@@ -17,7 +17,6 @@ import { geoGraticule10, geoOrthographic, geoPath } from "d3-geo";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { feature, mesh } from "topojson-client";
 import type { GeometryCollection, Topology } from "topojson-specification";
-import world50Url from "world-atlas/countries-50m.json?url";
 import world110Source from "world-atlas/countries-110m.json";
 import { detectLocale, localeFromCoordinates, localeTags, messages, type LanguageMode, type Locale } from "./i18n";
 
@@ -985,14 +984,10 @@ function OrbitCanvasGpu({
     let fpsWindowStarted = performance.now();
     let fpsFrames = 0;
 
-    void fetch(world50Url)
-      .then((response) => {
-        if (!response.ok) throw new Error("Detailed world map unavailable");
-        return response.json() as Promise<unknown>;
-      })
-      .then((source) => {
+    void import("world-atlas/countries-50m.json")
+      .then((module) => {
         if (mapDataCancelled) return;
-        detailedWorld = worldLayers(source);
+        detailedWorld = worldLayers(module.default);
         mapCache = null;
       })
       .catch(() => {
@@ -1113,7 +1108,7 @@ function OrbitCanvasGpu({
       if (mapCache?.key === key) return mapCache;
       if (lowDetail && mapCache && timestamp - lastMapBuild < 190) return mapCache;
 
-      const layers = lowDetail ? world110 : detailedWorld;
+      const layers = lowDetail || !detailedWorld ? world110 : detailedWorld;
       const projection = geoOrthographic()
         .translate([centerX, centerY])
         .scale(radius)
@@ -1589,6 +1584,7 @@ function SatelliteIcon({ category }: { category: SatelliteEntry["category"] }) {
 }
 
 export default function Home() {
+  const [hydrated, setHydrated] = useState(false);
   const [locale, setLocale] = useState<Locale>("en");
   const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
@@ -1623,6 +1619,7 @@ export default function Home() {
       if (savedColorMode && ["type", "constellation", "altitude", "risk"].includes(savedColorMode)) setColorMode(savedColorMode);
       const savedAutonomyMode = window.localStorage.getItem("satellite-agentbase-autonomy") as AutonomyMode | null;
       if (savedAutonomyMode && ["manual", "assist", "autopilot"].includes(savedAutonomyMode)) setAutonomyMode(savedAutonomyMode);
+      setHydrated(true);
     }, 0);
     return () => window.clearTimeout(hydration);
   }, []);
@@ -1734,6 +1731,10 @@ export default function Home() {
     ...(signals?.decays.map((event) => event.id) ?? []),
   ])), [signals]);
   const simulationTime = new Date((pausedAt ?? clock) + timeOffset * 60000);
+  const simulationTimeLabel = hydrated && clock > 0
+    ? new Intl.DateTimeFormat(localeTags[locale], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(simulationTime)
+    : "--:--:--";
+  const simulationTimeAria = hydrated && clock > 0 ? simulationTime.toLocaleString(localeTags[locale]) : "NOW";
   const selectedPosition = selectedEntry ? propagateEntry(selectedEntry, simulationTime) : null;
 
   const featured = useMemo(() => {
@@ -1907,7 +1908,7 @@ export default function Home() {
           <div className="mission-topbar">
             <div><span className="live-pulse" /> EARTH ORBIT / {dataState}</div>
             <div className="topbar-metrics">
-              <span>SIM TIME <b>{new Intl.DateTimeFormat(localeTags[locale], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(simulationTime)} LOCAL</b></span>
+              <span>SIM TIME <b>{simulationTimeLabel} LOCAL</b></span>
               <span>OBSERVER <b>{observer.label === "MY LOCATION" ? t["observer.myLocation"] : observer.label}</b></span>
               <span>SOURCE <b>{catalog?.source ?? "CONNECTING"}</b></span>
             </div>
@@ -2097,7 +2098,7 @@ export default function Home() {
             <div className="time-control">
               <button type="button" aria-label={pausedAt ? t["time.play"] : t["time.pause"]} onClick={() => setPausedAt((value) => value ? null : Date.now())}>{pausedAt ? "▶" : "Ⅱ"}</button>
               <div><span>TIME TRAVEL</span><strong>{timeOffset === 0 ? "NOW" : timeOffset < 0 ? `${Math.abs(timeOffset)}M AGO` : `+${Math.floor(timeOffset / 60)}H ${timeOffset % 60}M`}</strong></div>
-              <input type="range" min="-90" max="1440" step="15" value={timeOffset} aria-label={t["time.slider"]} aria-valuetext={simulationTime.toLocaleString(localeTags[locale])} onChange={(event) => setTimeOffset(Number(event.target.value))} />
+              <input type="range" min="-90" max="1440" step="15" value={timeOffset} aria-label={t["time.slider"]} aria-valuetext={simulationTimeAria} onChange={(event) => setTimeOffset(Number(event.target.value))} />
               <div className="time-presets"><button type="button" onClick={() => setTimeOffset(-60)}>−1H</button><button type="button" className={timeOffset === 0 ? "active" : ""} onClick={() => setTimeOffset(0)}>NOW</button><button type="button" onClick={() => setTimeOffset(360)}>+6H</button><button type="button" onClick={() => setTimeOffset(1440)}>+24H</button></div>
             </div>
             <div className="display-control">

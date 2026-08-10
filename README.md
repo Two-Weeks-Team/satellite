@@ -2,7 +2,9 @@
 
 An agentic orbital-intelligence experience that turns live public space data into an interactive Earth view, close-approach signals, decay monitoring, space-weather context, and local pass predictions.
 
-Live site: [satellite.agentba.se](https://satellite.agentba.se)
+Vercel production: [satellite-rho.vercel.app](https://satellite-rho.vercel.app)
+
+Original Sites deployment: [satellite.agentba.se](https://satellite.agentba.se)
 
 ## Highlights
 
@@ -25,14 +27,15 @@ Pass predictions are geometric calculations above 10 degrees elevation. They do 
 ## Tech stack
 
 - React 19 and Next.js 16 application APIs
-- Vinext and Vite for a Cloudflare Worker-compatible build
+- Native Next.js deployment on Vercel
+- Vinext and Vite scripts retained for the original Cloudflare Worker-compatible Sites build
 - `satellite.js` for orbital propagation
 - D3 Geo, TopoJSON, and Natural Earth-derived world geometry
 - TypeScript and ESLint
 
 ## Local development
 
-Requirements: Node.js 22.13 or newer and npm.
+Requirements: Node.js 24 and npm.
 
 ```bash
 npm ci
@@ -49,7 +52,7 @@ npm run build
 npm test
 ```
 
-The bounded build and test scripts require GNU `timeout` (available by default on Linux; provided by GNU coreutils on macOS). To validate an existing build artifact separately, run `npm run validate:artifact`.
+`npm test` creates a production Next.js build and exercises the rendered application plus its live/fallback catalog, signals, agent, and binary orbit endpoints.
 
 ## Project structure
 
@@ -57,9 +60,17 @@ The bounded build and test scripts require GNU `timeout` (available by default o
 - `app/api/` — catalog, signal, orbit-frame, and agent endpoints
 - `app/orbit.worker.ts` — background orbital propagation
 - `app/i18n.ts` — English, Korean, and Japanese copy
-- `worker/index.ts` — Cloudflare Worker entry point
-- `.openai/hosting.json` — OpenAI Sites hosting metadata
+- `vercel.json` — Vercel framework and reproducible install/build settings
+- `worker/index.ts` — retained Cloudflare Worker entry point for the Sites build
+- `.openai/hosting.json` — retained OpenAI Sites hosting metadata
 
 ## Deployment
 
-The repository is configured for OpenAI Sites. The production build emits a Worker-compatible artifact under `dist/` and validates its entry point and hosting manifest before deployment.
+The public GitHub repository is connected to the `2weeks-team/satellite` Vercel project. Pushes to `main` automatically create production deployments with the settings in `vercel.json`.
+
+The original OpenAI Sites-compatible build remains available as a rollback path:
+
+```bash
+npm run build:sites
+npm run start:sites
+```
