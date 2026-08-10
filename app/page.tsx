@@ -26,6 +26,15 @@ type PanelTab = "discover" | "risk" | "sky";
 type ColorMode = "type" | "constellation" | "altitude" | "risk";
 type AutonomyMode = "manual" | "assist" | "autopilot";
 
+const DEFAULT_LANGUAGE_MODE: LanguageMode = "en";
+const MIN_CAMERA_ZOOM = 0.45;
+const MAX_CAMERA_ZOOM = 4.5;
+const CAMERA_ZOOM_SENSITIVITY = 0.0018;
+
+function nextCameraZoom(current: number, deltaY: number) {
+  return Math.max(MIN_CAMERA_ZOOM, Math.min(MAX_CAMERA_ZOOM, current * Math.exp(-deltaY * CAMERA_ZOOM_SENSITIVITY)));
+}
+
 type CatalogResponse = {
   status: "live" | "cached-sample";
   source: string;
@@ -836,7 +845,7 @@ function OrbitCanvas({
     };
     const wheel = (event: WheelEvent) => {
       event.preventDefault();
-      cameraRef.current.zoom = Math.max(0.72, Math.min(1.35, cameraRef.current.zoom - event.deltaY * 0.0005));
+      cameraRef.current.zoom = nextCameraZoom(cameraRef.current.zoom, event.deltaY);
       if (reducedMotion) draw(performance.now());
     };
 
@@ -1492,7 +1501,7 @@ function OrbitCanvasGpu({
     };
     const wheel = (event: WheelEvent) => {
       event.preventDefault();
-      cameraRef.current.zoom = Math.max(0.72, Math.min(1.35, cameraRef.current.zoom - event.deltaY * 0.0005));
+      cameraRef.current.zoom = nextCameraZoom(cameraRef.current.zoom, event.deltaY);
       lowDetailUntil = performance.now() + 220;
     };
     const resumeFromBackground = (forceHardReset = false) => {
@@ -1586,7 +1595,7 @@ function SatelliteIcon({ category }: { category: SatelliteEntry["category"] }) {
 export default function Home() {
   const [hydrated, setHydrated] = useState(false);
   const [locale, setLocale] = useState<Locale>("en");
-  const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
+  const [languageMode, setLanguageMode] = useState<LanguageMode>(DEFAULT_LANGUAGE_MODE);
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [signals, setSignals] = useState<SignalsResponse | null>(null);
   const [dataError, setDataError] = useState("");
@@ -1612,7 +1621,7 @@ export default function Home() {
   useEffect(() => {
     const hydration = window.setTimeout(() => {
       const saved = window.localStorage.getItem("satellite-agentbase-language") as LanguageMode | null;
-      const mode = saved && ["auto", "en", "ko", "ja"].includes(saved) ? saved : "auto";
+      const mode = saved && ["auto", "en", "ko", "ja"].includes(saved) ? saved : DEFAULT_LANGUAGE_MODE;
       setLanguageMode(mode);
       setLocale(mode === "auto" ? detectLocale() : mode);
       const savedColorMode = window.localStorage.getItem("satellite-agentbase-color-mode") as ColorMode | null;
