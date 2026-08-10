@@ -1,0 +1,71 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "satellite-data-api",
+  "account_id": "d0d06bd043ebf75c9fd8aba7c458243a",
+  "main": "data-worker.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "satellite-api.agentba.se",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app",
+    "UPSTREAM_PROXY_URL": "https://satellite.agentba.se/api/signals?upstream=1"
+  },
+  "triggers": {
+    "crons": ["0 */2 * * *", "0 18 * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "satellite-production",
+      "database_id": "4114e073-fd21-4004-a4f8-568ef44ee537",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "satellite-archive-production"
+    }
+  ],
+  "env": {
+    "preview": {
+      "name": "satellite-data-api-preview",
+      "workers_dev": true,
+      "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+      "routes": [],
+      "vars": {
+        "ENVIRONMENT": "preview",
+        "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app",
+        "UPSTREAM_PROXY_URL": "https://satellite.agentba.se/api/signals?upstream=1"
+      },
+      "triggers": {
+        "crons": []
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "satellite-preview",
+          "database_id": "134bb44c-30d9-48a7-9aac-138effe22757",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "ARCHIVE",
+          "bucket_name": "satellite-archive-preview"
+        }
+      ]
+    }
+  }
+}

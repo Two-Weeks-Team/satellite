@@ -10,7 +10,43 @@ type Conjunction = {
   dilutionKm: number;
 };
 
-const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
+type Decay = {
+  id: number;
+  name: string;
+  epoch: string;
+  meanMotion: number;
+  bstar: number;
+};
+
+type SpaceWeather = {
+  time: string;
+  kp: number;
+  level: "quiet" | "active" | "storm" | "severe";
+};
+
+type SignalsResult = {
+  status: "live" | "partial" | "offline";
+  fetchedAt: string;
+  cachedAt?: string;
+  conjunctions: Conjunction[];
+  decays: Decay[];
+  spaceWeather: SpaceWeather | null;
+  sources: {
+    conjunctions: string;
+    decays: string;
+    spaceWeather: string;
+  };
+};
+
+type RawSignalSources = {
+  conjunctions: string | null;
+  decays: string | null;
+  spaceWeather: string | null;
+};
+
+type UpstreamSignalsResult = SignalsResult & { rawSources?: RawSignalSources };
+
+const SOCRATES = "https://celestrak.org/SOCRATES-Plus/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
 const TWO_HOURS = 60 * 60 * 2;
@@ -69,7 +105,7 @@ function parseConjunctions(html: string) {
   return conjunctions.slice(0, 12);
 }
 
-function currentKp(rows: unknown) {
+function currentKp(rows: unknown): SpaceWeather | null {
   if (!Array.isArray(rows) || rows.length < 1) return null;
   const latest = rows[rows.length - 1];
   const record = Array.isArray(latest) && Array.isArray(rows[0])
@@ -101,32 +137,62 @@ async function cachedFetchText(url: string, accept: string) {
   }
 }
 
-async function cachedFetchJson<T>(url: string) {
-  return JSON.parse(await cachedFetchText(url, "application/json")) as T;
+function isStoredSignals(value: unknown): value is SignalsResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<SignalsResult>;
+  return typeof candidate.fetchedAt === "string"
+    && Array.isArray(candidate.conjunctions)
+    && Array.isArray(candidate.decays)
+    && typeof candidate.sources === "object";
 }
 
-async function loadSignalsOnce() {
+async function loadStoredSignals(): Promise<SignalsResult | null> {
+  const baseUrl = process.env.SATELLITE_DATA_API_URL?.replace(/\/$/, "");
+  if (!baseUrl) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}/api/signals`, {
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+      next: { revalidate: 120 },
+    } as RequestInit & { next: { revalidate: number } });
+    if (!response.ok) return null;
+    const result: unknown = await response.json();
+    if (!isStoredSignals(result) || result.status !== "live") return null;
+    const age = Date.now() - Date.parse(result.fetchedAt);
+    if (!Number.isFinite(age) || age < 0 || age > 6 * 60 * 60 * 1000) return null;
+    return result;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function loadUpstreamSignals(includeRaw = false): Promise<UpstreamSignalsResult> {
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
-    cachedFetchText(SOCRATES, "text/html").then(parseConjunctions),
-    cachedFetchJson<Array<Record<string, string | number>>>(DECAYING).then((data) => {
-      return data.slice(0, 20).map((item) => ({
+    cachedFetchText(SOCRATES, "text/html").then((raw) => ({ raw, value: parseConjunctions(raw) })),
+    cachedFetchText(DECAYING, "application/json").then((raw) => {
+      const data = JSON.parse(raw) as Array<Record<string, string | number>>;
+      return { raw, value: data.slice(0, 20).map((item): Decay => ({
         id: Number(item.NORAD_CAT_ID),
         name: String(item.OBJECT_NAME),
         epoch: String(item.EPOCH),
         meanMotion: Number(item.MEAN_MOTION),
         bstar: Number(item.BSTAR),
-      }));
+      })) };
     }),
-    cachedFetchJson<unknown>(KP).then(currentKp),
+    cachedFetchText(KP, "application/json").then((raw) => ({ raw, value: currentKp(JSON.parse(raw)) })),
   ]);
 
-  const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
-  const decays = decayResult.status === "fulfilled" ? decayResult.value : [];
-  const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
+  const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value.value : [];
+  const decays = decayResult.status === "fulfilled" ? decayResult.value.value : [];
+  const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value.value : null;
   const liveSources = [conjunctions.length > 0, decays.length > 0, spaceWeather !== null].filter(Boolean).length;
 
-  return {
+  const result: UpstreamSignalsResult = {
     status: liveSources === 3 ? "live" as const : liveSources > 0 ? "partial" as const : "offline" as const,
     fetchedAt,
     conjunctions,
@@ -138,14 +204,26 @@ async function loadSignalsOnce() {
       spaceWeather: "NOAA SWPC",
     },
   };
+  if (includeRaw) {
+    result.rawSources = {
+      conjunctions: conjunctionResult.status === "fulfilled" ? conjunctionResult.value.raw : null,
+      decays: decayResult.status === "fulfilled" ? decayResult.value.raw : null,
+      spaceWeather: kpResult.status === "fulfilled" ? kpResult.value.raw : null,
+    };
+  }
+  return result;
 }
 
-type SignalsResult = Awaited<ReturnType<typeof loadSignalsOnce>>;
+async function loadSignalsOnce(): Promise<SignalsResult> {
+  const stored = await loadStoredSignals();
+  return stored ? { ...stored, cachedAt: new Date().toISOString() } : loadUpstreamSignals();
+}
+
 let signalsCache: SignalsResult | null = null;
 let signalsPromise: Promise<SignalsResult> | null = null;
 
 function signalsCacheIsFresh(signals: SignalsResult) {
-  const age = Date.now() - Date.parse(signals.fetchedAt);
+  const age = Date.now() - Date.parse(signals.cachedAt ?? signals.fetchedAt);
   const maxAge = (signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS) * 1000;
   return Number.isFinite(age) && age >= 0 && age < maxAge;
 }
@@ -164,7 +242,17 @@ export async function loadSignals() {
   return signalsPromise;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  if (url.searchParams.get("upstream") === "1") {
+    const expected = process.env.SATELLITE_UPSTREAM_PROXY_TOKEN?.trim();
+    const authorization = request.headers.get("Authorization");
+    if (!expected || authorization !== `Bearer ${expected}`) {
+      return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "Cache-Control": "no-store" } });
+    }
+    const signals = await loadUpstreamSignals(true);
+    return Response.json(signals, { headers: { "Cache-Control": "private, no-store" } });
+  }
   const signals = await loadSignals();
   const cacheSeconds = signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS;
   return Response.json(signals, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });
