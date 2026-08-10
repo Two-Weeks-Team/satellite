@@ -40,6 +40,8 @@ next-env.d.ts
 *.tsbuildinfo
 /dist/
 /.wrangler/
+/cloudflare/.wrangler/
+/cloudflare/worker-configuration.d.ts
 /.sites-runtime/
 /outputs/
 /work/

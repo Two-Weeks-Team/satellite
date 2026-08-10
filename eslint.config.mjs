@@ -10,10 +10,12 @@ const eslintConfig = defineConfig([
     // Default ignores of eslint-config-next:
     ".next/**",
     ".vercel/**",
+    ".wrangler/**",
     ".playwright-cli/**",
     "output/**",
     "out/**",
     "build/**",
+    "cloudflare/worker-configuration.d.ts",
     "next-env.d.ts",
   ]),
 ]);

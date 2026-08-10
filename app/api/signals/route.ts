@@ -10,6 +10,33 @@ type Conjunction = {
   dilutionKm: number;
 };
 
+type Decay = {
+  id: number;
+  name: string;
+  epoch: string;
+  meanMotion: number;
+  bstar: number;
+};
+
+type SpaceWeather = {
+  time: string;
+  kp: number;
+  level: "quiet" | "active" | "storm" | "severe";
+};
+
+type SignalsResult = {
+  status: "live" | "partial" | "offline";
+  fetchedAt: string;
+  conjunctions: Conjunction[];
+  decays: Decay[];
+  spaceWeather: SpaceWeather | null;
+  sources: {
+    conjunctions: string;
+    decays: string;
+    spaceWeather: string;
+  };
+};
+
 const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
@@ -69,7 +96,7 @@ function parseConjunctions(html: string) {
   return conjunctions.slice(0, 12);
 }
 
-function currentKp(rows: unknown) {
+function currentKp(rows: unknown): SpaceWeather | null {
   if (!Array.isArray(rows) || rows.length < 1) return null;
   const latest = rows[rows.length - 1];
   const record = Array.isArray(latest) && Array.isArray(rows[0])
@@ -105,12 +132,47 @@ async function cachedFetchJson<T>(url: string) {
   return JSON.parse(await cachedFetchText(url, "application/json")) as T;
 }
 
-async function loadSignalsOnce() {
+function isStoredSignals(value: unknown): value is SignalsResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<SignalsResult>;
+  return typeof candidate.fetchedAt === "string"
+    && Array.isArray(candidate.conjunctions)
+    && Array.isArray(candidate.decays)
+    && typeof candidate.sources === "object";
+}
+
+async function loadStoredSignals(): Promise<SignalsResult | null> {
+  const baseUrl = process.env.SATELLITE_DATA_API_URL?.replace(/\/$/, "");
+  if (!baseUrl) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}/api/signals`, {
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+      next: { revalidate: 120 },
+    } as RequestInit & { next: { revalidate: number } });
+    if (!response.ok) return null;
+    const result: unknown = await response.json();
+    if (!isStoredSignals(result) || result.status !== "live") return null;
+    const age = Date.now() - Date.parse(result.fetchedAt);
+    if (!Number.isFinite(age) || age < 0 || age > 6 * 60 * 60 * 1000) return null;
+    return result;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function loadSignalsOnce(): Promise<SignalsResult> {
+  const stored = await loadStoredSignals();
+  if (stored) return stored;
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
     cachedFetchText(SOCRATES, "text/html").then(parseConjunctions),
     cachedFetchJson<Array<Record<string, string | number>>>(DECAYING).then((data) => {
-      return data.slice(0, 20).map((item) => ({
+      return data.slice(0, 20).map((item): Decay => ({
         id: Number(item.NORAD_CAT_ID),
         name: String(item.OBJECT_NAME),
         epoch: String(item.EPOCH),
@@ -140,7 +202,6 @@ async function loadSignalsOnce() {
   };
 }
 
-type SignalsResult = Awaited<ReturnType<typeof loadSignalsOnce>>;
 let signalsCache: SignalsResult | null = null;
 let signalsPromise: Promise<SignalsResult> | null = null;
 
