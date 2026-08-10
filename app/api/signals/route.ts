@@ -165,9 +165,7 @@ async function loadStoredSignals(): Promise<SignalsResult | null> {
   }
 }
 
-async function loadSignalsOnce(): Promise<SignalsResult> {
-  const stored = await loadStoredSignals();
-  if (stored) return stored;
+async function loadUpstreamSignals(): Promise<SignalsResult> {
   const fetchedAt = new Date().toISOString();
   const [conjunctionResult, decayResult, kpResult] = await Promise.allSettled([
     cachedFetchText(SOCRATES, "text/html").then(parseConjunctions),
@@ -202,6 +200,11 @@ async function loadSignalsOnce(): Promise<SignalsResult> {
   };
 }
 
+async function loadSignalsOnce(): Promise<SignalsResult> {
+  const stored = await loadStoredSignals();
+  return stored ?? loadUpstreamSignals();
+}
+
 let signalsCache: SignalsResult | null = null;
 let signalsPromise: Promise<SignalsResult> | null = null;
 
@@ -225,7 +228,17 @@ export async function loadSignals() {
   return signalsPromise;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  if (url.searchParams.get("upstream") === "1") {
+    const expected = process.env.SATELLITE_UPSTREAM_PROXY_TOKEN?.trim();
+    const authorization = request.headers.get("Authorization");
+    if (!expected || authorization !== `Bearer ${expected}`) {
+      return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "Cache-Control": "no-store" } });
+    }
+    const signals = await loadUpstreamSignals();
+    return Response.json(signals, { headers: { "Cache-Control": "private, no-store" } });
+  }
   const signals = await loadSignals();
   const cacheSeconds = signals.status === "live" ? TWO_HOURS : FAILURE_CACHE_SECONDS;
   return Response.json(signals, { headers: { "Cache-Control": `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds}` } });

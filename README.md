@@ -74,6 +74,8 @@ The public GitHub repository is connected to the `2weeks-team/satellite` Vercel 
 
 The frontend reads recent complete signal snapshots from `https://satellite-api.agentba.se`. If the stored snapshot is partial, unavailable, or more than six hours old, the Vercel API falls back to the public upstream feeds. Cloudflare Cron refreshes signals every two hours and the active catalog daily; D1 keeps queryable state and R2 retains the raw source payloads.
 
+When CelesTrak rejects a Worker-origin request, the Worker retries those feeds through a token-protected Vercel upstream relay. Configure the same secret as `SATELLITE_UPSTREAM_PROXY_TOKEN` in Vercel and `UPSTREAM_PROXY_TOKEN` in the Worker; neither value belongs in the repository.
+
 Cloudflare deployment and migration commands use the `cloudflare/wrangler.jsonc` configuration so they do not collide with the retained Sites build:
 
 ```bash

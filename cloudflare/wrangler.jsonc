@@ -18,7 +18,8 @@
   },
   "vars": {
     "ENVIRONMENT": "production",
-    "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app"
+    "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app",
+    "UPSTREAM_PROXY_URL": "https://satellite.agentba.se/api/signals?upstream=1"
   },
   "triggers": {
     "crons": ["0 */2 * * *", "0 18 * * *"]
@@ -44,7 +45,8 @@
       "routes": [],
       "vars": {
         "ENVIRONMENT": "preview",
-        "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app"
+        "ALLOWED_ORIGINS": "https://satellite.agentba.se,https://satellite-rho.vercel.app",
+        "UPSTREAM_PROXY_URL": "https://satellite.agentba.se/api/signals?upstream=1"
       },
       "triggers": {
         "crons": []

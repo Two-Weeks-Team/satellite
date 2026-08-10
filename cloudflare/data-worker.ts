@@ -6,6 +6,8 @@ interface Env {
   ENVIRONMENT: "preview" | "production";
   ALLOWED_ORIGINS: string;
   INGESTION_TOKEN?: string;
+  UPSTREAM_PROXY_URL?: string;
+  UPSTREAM_PROXY_TOKEN?: string;
 }
 
 type IngestionScope = "signals" | "catalog";
@@ -44,7 +46,7 @@ type CatalogObject = {
   orbitalElements: string;
 };
 
-const SOCRATES = "https://celestrak.org/SOCRATES/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
+const SOCRATES = "https://celestrak.org/SOCRATES-Plus/table-socrates.php?NAME=,&ORDER=MINRANGE&MAX=12";
 const DECAYING = "https://celestrak.org/NORAD/elements/gp.php?SPECIAL=DECAYING&FORMAT=JSON";
 const KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json";
 const CATALOG_SOURCES = [
@@ -104,6 +106,39 @@ async function fetchText(url: string, accept: string) {
     });
     if (!response.ok) throw new Error(`${new URL(url).hostname} responded ${response.status}`);
     return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchUpstreamProxy(env: Env) {
+  const url = env.UPSTREAM_PROXY_URL?.trim();
+  const token = env.UPSTREAM_PROXY_TOKEN?.trim();
+  if (!url || !token) throw new Error("Upstream proxy is not configured");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Upstream proxy responded ${response.status}`);
+    const value = await response.json() as {
+      conjunctions?: Conjunction[];
+      decays?: Decay[];
+      spaceWeather?: SpaceWeather | null;
+    };
+    if (!Array.isArray(value.conjunctions) || !Array.isArray(value.decays)) {
+      throw new Error("Upstream proxy returned an invalid payload");
+    }
+    return {
+      conjunctions: value.conjunctions,
+      decays: value.decays,
+      spaceWeather: value.spaceWeather ?? null,
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -282,10 +317,11 @@ async function completeRun(
   completedAt: number,
   itemCount: number,
   archiveKey: string,
+  warning: string | null = null,
 ) {
   await db.prepare(
-    "UPDATE ingestion_runs SET status = 'completed', completed_at = ?, item_count = ?, archive_key = ? WHERE id = ?",
-  ).bind(completedAt, itemCount, archiveKey, id).run();
+    "UPDATE ingestion_runs SET status = 'completed', completed_at = ?, item_count = ?, archive_key = ?, error_message = ? WHERE id = ?",
+  ).bind(completedAt, itemCount, archiveKey, warning, id).run();
 }
 
 async function failRun(db: D1Database, id: string, error: unknown) {
@@ -314,12 +350,39 @@ async function ingestSignals(env: Env) {
       fetchText(KP, "application/json").then((text) => currentKp(JSON.parse(text))),
     ]);
 
-    const conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
-    const decays = decayResult.status === "fulfilled" ? decayResult.value : [];
-    const spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
-    const failures = [conjunctionResult, decayResult, kpResult]
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
+    let conjunctions = conjunctionResult.status === "fulfilled" ? conjunctionResult.value : [];
+    let decays = decayResult.status === "fulfilled" ? decayResult.value : [];
+    let spaceWeather = kpResult.status === "fulfilled" ? kpResult.value : null;
+    const reason = (result: PromiseSettledResult<unknown>, fallback: string) => result.status === "rejected"
+      ? result.reason instanceof Error ? result.reason.message : String(result.reason)
+      : fallback;
+    const warnings: string[] = [];
+    let conjunctionSource = "CelesTrak SOCRATES Plus";
+    let decaySource = "CelesTrak Potential Decays";
+
+    if (!conjunctions.length || !decays.length) {
+      try {
+        const proxy = await fetchUpstreamProxy(env);
+        if (!conjunctions.length && proxy.conjunctions.length) {
+          conjunctions = proxy.conjunctions.slice(0, 12);
+          conjunctionSource = "CelesTrak SOCRATES Plus via protected Vercel relay";
+          warnings.push(reason(conjunctionResult, "Direct conjunction source returned no records"));
+        }
+        if (!decays.length && proxy.decays.length) {
+          decays = proxy.decays.slice(0, 20);
+          decaySource = "CelesTrak Potential Decays via protected Vercel relay";
+          warnings.push(reason(decayResult, "Direct decay source returned no records"));
+        }
+        if (!spaceWeather && proxy.spaceWeather) spaceWeather = proxy.spaceWeather;
+      } catch (error) {
+        warnings.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const failures: string[] = [];
+    if (!conjunctions.length) failures.push(reason(conjunctionResult, "Conjunction source returned no records"));
+    if (!decays.length) failures.push(reason(decayResult, "Decay source returned no records"));
+    if (!spaceWeather) failures.push(reason(kpResult, "Space-weather source returned no records"));
     if (!conjunctions.length && !decays.length && !spaceWeather) {
       throw new Error(failures.join("; ") || "All signal sources returned empty responses");
     }
@@ -387,14 +450,22 @@ async function ingestSignals(env: Env) {
       decays,
       spaceWeather,
       failures,
+      warnings,
       sources: {
-        conjunctions: "CelesTrak SOCRATES Plus",
-        decays: "CelesTrak Potential Decays",
+        conjunctions: conjunctionSource,
+        decays: decaySource,
         spaceWeather: "NOAA SWPC",
       },
     };
     await putArchive(env.ARCHIVE, archiveKey, JSON.stringify(payload), "application/json");
-    await completeRun(env.DB, runId, Date.now(), conjunctions.length + decays.length + (spaceWeather ? 1 : 0), archiveKey);
+    await completeRun(
+      env.DB,
+      runId,
+      Date.now(),
+      conjunctions.length + decays.length + (spaceWeather ? 1 : 0),
+      archiveKey,
+      failures.length ? failures.join("; ").slice(0, 1000) : null,
+    );
     return { runId, archiveKey, ...payload };
   } catch (error) {
     await failRun(env.DB, runId, error);
@@ -571,12 +642,13 @@ async function latestSignals(db: D1Database) {
 }
 
 async function health(db: D1Database) {
-  const [satellites, conjunctions, decays, weather, runs] = await db.batch([
+  const [satellites, conjunctions, decays, weather, failedRuns, partialRuns] = await db.batch([
     db.prepare("SELECT COUNT(*) AS count FROM satellites"),
     db.prepare("SELECT COUNT(*) AS count FROM conjunction_events"),
     db.prepare("SELECT COUNT(*) AS count FROM decay_events"),
     db.prepare("SELECT COUNT(*) AS count FROM space_weather"),
     db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'failed' AND started_at > ?").bind(Date.now() - 24 * 60 * 60 * 1000),
+    db.prepare("SELECT COUNT(*) AS count FROM ingestion_runs WHERE status = 'completed' AND error_message IS NOT NULL AND started_at > ?").bind(Date.now() - 24 * 60 * 60 * 1000),
   ]);
   const count = (result: D1Result<unknown>) => {
     const row = result.results[0] as Record<string, unknown> | undefined;
@@ -587,7 +659,8 @@ async function health(db: D1Database) {
     conjunctions: count(conjunctions),
     decays: count(decays),
     spaceWeather: count(weather),
-    failedRunsLast24h: count(runs),
+    failedRunsLast24h: count(failedRuns),
+    partialRunsLast24h: count(partialRuns),
   };
 }
 
@@ -606,7 +679,7 @@ async function handleFetch(request: Request, env: Env) {
   if (request.method === "GET" && url.pathname === "/health") {
     const counts = await health(env.DB);
     return jsonResponse(request, env, {
-      status: counts.failedRunsLast24h ? "degraded" : "ok",
+      status: counts.failedRunsLast24h || counts.partialRunsLast24h ? "degraded" : "ok",
       environment: env.ENVIRONMENT,
       database: counts,
       checkedAt: new Date().toISOString(),
