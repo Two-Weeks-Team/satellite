@@ -1,6 +1,11 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import type { CompactOmm, StoredCatalogSnapshot } from "../lib/catalog-snapshot";
+import {
+  isStoredCatalogSnapshot,
+  searchStoredCatalog,
+  type CompactOmm,
+  type StoredCatalogSnapshot,
+} from "../lib/catalog-snapshot";
 import {
   historyTupleToInsight,
   isStoredHistorySummary,
@@ -77,6 +82,7 @@ const HISTORY_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
 const MAX_SIGNAL_SOURCE_BYTES = 2_000_000;
 const MAX_CATALOG_SOURCE_BYTES = 10_000_000;
 const MAX_RELAY_BYTES = 12_000_000;
+const MAX_COMPACT_CATALOG_BYTES = 4_400_000;
 const MAX_HISTORY_SUMMARY_BYTES = 4_400_000;
 const CATALOG_FRESHNESS_MS = 36 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -860,45 +866,6 @@ async function fetchCatalogCsv() {
   throw new Error(failures.join("; "));
 }
 
-async function upsertCatalog(db: D1Database, objects: CatalogObject[], ingestedAt: number) {
-  const statements: D1PreparedStatement[] = [];
-  const flush = async () => {
-    if (!statements.length) return;
-    await db.batch(statements.splice(0));
-  };
-
-  for (let offset = 0; offset < objects.length; offset += 512) {
-    const packed = objects.slice(offset, offset + 512).map((item) => [
-      item.noradId,
-      item.objectName,
-      item.objectId,
-      item.epoch,
-      item.orbitalElements,
-      ingestedAt,
-    ]);
-    statements.push(db.prepare(`
-      INSERT INTO satellites (norad_id, object_name, object_id, epoch, orbital_elements, ingested_at)
-      SELECT
-        CAST(json_extract(value, '$[0]') AS INTEGER),
-        CAST(json_extract(value, '$[1]') AS TEXT),
-        CAST(json_extract(value, '$[2]') AS TEXT),
-        CAST(json_extract(value, '$[3]') AS INTEGER),
-        CAST(json_extract(value, '$[4]') AS TEXT),
-        CAST(json_extract(value, '$[5]') AS INTEGER)
-      FROM json_each(?)
-      WHERE true
-      ON CONFLICT(norad_id) DO UPDATE SET
-        object_name = excluded.object_name,
-        object_id = excluded.object_id,
-        epoch = excluded.epoch,
-        orbital_elements = excluded.orbital_elements,
-        ingested_at = excluded.ingested_at
-    `).bind(JSON.stringify(packed)));
-    if (statements.length >= 40) await flush();
-  }
-  await flush();
-}
-
 async function ingestCatalog(env: WorkerEnv, force = false) {
   const startedAt = Date.now();
   const parts = utcParts(startedAt);
@@ -942,8 +909,6 @@ async function ingestCatalog(env: WorkerEnv, force = false) {
       putArchive(env.ARCHIVE, compactArchiveKey, JSON.stringify(compactSnapshot), "application/json"),
       putArchive(env.ARCHIVE, historyArchiveKey, historyPayload, "application/json"),
     ]);
-    await upsertCatalog(env.DB, objects, startedAt);
-    await env.DB.prepare("DELETE FROM satellites WHERE ingested_at < ?").bind(startedAt).run();
     await env.DB.batch([
       env.DB.prepare(`
         INSERT INTO catalog_snapshots (snapshot_date, fetched_at, object_count, archive_key, source)
@@ -1107,21 +1072,28 @@ async function latestSignals(db: D1Database) {
   };
 }
 
-async function catalogSnapshotResponse(request: Request, env: WorkerEnv) {
+async function latestCatalogObject(env: WorkerEnv) {
   const snapshot = await env.DB.prepare(`
     SELECT fetched_at AS fetchedAt, object_count AS objectCount, archive_key AS archiveKey, source
     FROM catalog_snapshots
     ORDER BY fetched_at DESC
     LIMIT 1
   `).first<Record<string, unknown>>();
-  if (!snapshot) return jsonResponse(request, env, { error: "Catalog snapshot unavailable" }, 404);
+  if (!snapshot) return null;
 
   const archiveKey = String(snapshot.archiveKey);
   const compactArchiveKey = archiveKey.endsWith("/active.csv")
     ? archiveKey.replace(/\/active\.csv$/, "/active.compact.json")
     : `${archiveKey}.compact.json`;
   const object = await env.ARCHIVE.get(compactArchiveKey);
-  if (!object) return jsonResponse(request, env, { error: "Compact catalog snapshot unavailable" }, 404);
+  if (!object) return null;
+  return { snapshot, object };
+}
+
+async function catalogSnapshotResponse(request: Request, env: WorkerEnv) {
+  const latest = await latestCatalogObject(env);
+  if (!latest) return jsonResponse(request, env, { error: "Compact catalog snapshot unavailable" }, 404);
+  const { snapshot, object } = latest;
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -1139,6 +1111,32 @@ async function catalogSnapshotResponse(request: Request, env: WorkerEnv) {
     headers.set("Vary", "Origin");
   }
   return new Response(object.body, { headers });
+}
+
+async function catalogLatestResponse(request: Request, env: WorkerEnv) {
+  const latest = await latestCatalogObject(env);
+  if (!latest) return jsonResponse(request, env, { error: "Compact catalog snapshot unavailable" }, 404);
+  const { object } = latest;
+  if (object.size > MAX_COMPACT_CATALOG_BYTES) {
+    console.error(JSON.stringify({
+      message: "compact catalog exceeds lookup read limit",
+      bytes: object.size,
+      limit: MAX_COMPACT_CATALOG_BYTES,
+    }));
+    return jsonResponse(request, env, { error: "Compact catalog snapshot exceeds lookup limit" }, 503);
+  }
+  const headers = new Headers({ "Content-Length": String(object.size) });
+  const raw = await readTextWithinLimit(new Response(object.body, { headers }), MAX_COMPACT_CATALOG_BYTES);
+  const parsed: unknown = JSON.parse(raw);
+  if (!isStoredCatalogSnapshot(parsed)) {
+    return jsonResponse(request, env, { error: "Compact catalog snapshot is invalid" }, 503);
+  }
+  const url = new URL(request.url);
+  return jsonResponse(
+    request,
+    env,
+    searchStoredCatalog(parsed, url.searchParams.get("q"), Number(url.searchParams.get("limit")) || 25),
+  );
 }
 
 function requestedNoradIds(url: URL) {
@@ -1201,8 +1199,7 @@ async function historyIntelligence(request: Request, env: WorkerEnv) {
 
 async function health(db: D1Database) {
   const now = Date.now();
-  const [satellites, conjunctions, decays, weather, failedRuns, partialRuns, latestSignalRun, latestCatalog, latestHistory] = await db.batch([
-    db.prepare("SELECT COUNT(*) AS count FROM satellites"),
+  const [conjunctions, decays, weather, failedRuns, partialRuns, latestSignalRun, latestCatalog, latestHistory] = await db.batch([
     db.prepare("SELECT COUNT(*) AS count FROM conjunction_events"),
     db.prepare("SELECT COUNT(*) AS count FROM decay_events"),
     db.prepare("SELECT COUNT(*) AS count FROM space_weather"),
@@ -1244,7 +1241,7 @@ async function health(db: D1Database) {
   const historyGeneratedAt = Number(history?.generatedAt) || 0;
   return {
     database: {
-      satellites: count(satellites),
+      satellites: Number(catalog?.objectCount ?? 0),
       conjunctions: count(conjunctions),
       decays: count(decays),
       spaceWeather: count(weather),
@@ -1304,6 +1301,10 @@ async function handleFetch(request: Request, env: WorkerEnv) {
         catalog: state.latestCatalog,
         history: state.latestHistory,
       },
+      storage: {
+        catalog: "r2",
+        operational: "d1",
+      },
       incidents: state.incidents,
       checkedAt: new Date().toISOString(),
     });
@@ -1322,26 +1323,7 @@ async function handleFetch(request: Request, env: WorkerEnv) {
   }
 
   if (request.method === "GET" && url.pathname === "/api/catalog/latest") {
-    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 25));
-    const query = url.searchParams.get("q")?.trim();
-    const statement = query
-      ? env.DB.prepare(`
-          SELECT norad_id AS noradId, object_name AS objectName, object_id AS objectId, epoch, orbital_elements AS orbitalElements
-          FROM satellites WHERE object_name LIKE ? ESCAPE '\\' ORDER BY object_name COLLATE NOCASE LIMIT ?
-        `).bind(`%${query.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`, limit)
-      : env.DB.prepare(`
-          SELECT norad_id AS noradId, object_name AS objectName, object_id AS objectId, epoch, orbital_elements AS orbitalElements
-          FROM satellites ORDER BY object_name COLLATE NOCASE LIMIT ?
-        `).bind(limit);
-    const result = await statement.all();
-    return jsonResponse(request, env, {
-      count: result.results.length,
-      items: result.results.map((row) => ({
-        ...row,
-        epoch: new Date(Number(row.epoch)).toISOString(),
-        orbitalElements: JSON.parse(String(row.orbitalElements)),
-      })),
-    });
+    return catalogLatestResponse(request, env);
   }
 
   if (request.method === "POST" && url.pathname === "/internal/ingest") {
