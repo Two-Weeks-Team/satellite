@@ -11,6 +11,13 @@ type Conjunction = {
   relativeSpeed: number;
   maxProbability: number;
   dilutionKm: number;
+  history?: {
+    observations: number;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    minRangeKm: number;
+    peakProbability: number;
+  };
 };
 
 type Decay = {
@@ -19,6 +26,13 @@ type Decay = {
   epoch: string;
   meanMotion: number;
   bstar: number;
+  history?: {
+    observations: number;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    meanMotionDelta: number;
+    bstarDelta: number;
+  };
 };
 
 type SpaceWeather = {
@@ -145,20 +159,38 @@ async function cachedFetchText(url: string, accept: string, maxBytes = MAX_SIGNA
 
 function isConjunction(value: unknown): value is Conjunction {
   const candidate = value as Partial<Conjunction> | null;
+  const history = candidate?.history;
+  const historyValid = history === undefined || (
+    typeof history === "object"
+    && Number.isInteger(history.observations) && history.observations > 0
+    && typeof history.firstSeenAt === "string" && Number.isFinite(Date.parse(history.firstSeenAt))
+    && typeof history.lastSeenAt === "string" && Number.isFinite(Date.parse(history.lastSeenAt))
+    && Number.isFinite(history.minRangeKm) && Number.isFinite(history.peakProbability)
+  );
   return !!candidate && typeof candidate === "object"
     && Number.isFinite(candidate.id1) && Number.isFinite(candidate.id2)
     && typeof candidate.name1 === "string" && typeof candidate.name2 === "string"
     && typeof candidate.tca === "string" && Number.isFinite(Date.parse(candidate.tca))
     && [candidate.rangeKm, candidate.relativeSpeed, candidate.maxProbability, candidate.dilutionKm]
-      .every((number) => Number.isFinite(number));
+      .every((number) => Number.isFinite(number))
+    && historyValid;
 }
 
 function isDecay(value: unknown): value is Decay {
   const candidate = value as Partial<Decay> | null;
+  const history = candidate?.history;
+  const historyValid = history === undefined || (
+    typeof history === "object"
+    && Number.isInteger(history.observations) && history.observations > 0
+    && typeof history.firstSeenAt === "string" && Number.isFinite(Date.parse(history.firstSeenAt))
+    && typeof history.lastSeenAt === "string" && Number.isFinite(Date.parse(history.lastSeenAt))
+    && Number.isFinite(history.meanMotionDelta) && Number.isFinite(history.bstarDelta)
+  );
   return !!candidate && typeof candidate === "object"
     && Number.isFinite(candidate.id) && typeof candidate.name === "string"
     && typeof candidate.epoch === "string" && Number.isFinite(Date.parse(candidate.epoch))
-    && Number.isFinite(candidate.meanMotion) && Number.isFinite(candidate.bstar);
+    && Number.isFinite(candidate.meanMotion) && Number.isFinite(candidate.bstar)
+    && historyValid;
 }
 
 function isSpaceWeather(value: unknown): value is SpaceWeather {

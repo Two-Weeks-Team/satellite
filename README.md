@@ -11,6 +11,7 @@ Vercel fallback hostname: [satellite-rho.vercel.app](https://satellite-rho.verce
 - Live active-satellite catalog with SGP4 propagation and smooth GPU-assisted motion
 - Interactive 3D Earth with filtering, search, favorites, time controls, and multiple color modes
 - Sentinel, Scout, and Sky agent briefings with manual, assist, and autopilot modes
+- History-calibrated prediction confidence and persistent risk/decay prioritization
 - Close-approach, potential-decay, and NOAA space-weather signals
 - Observer-location pass predictions for featured satellites
 - English, Korean, and Japanese interfaces
@@ -53,12 +54,12 @@ npm run build
 npm test
 ```
 
-`npm test` creates a production Next.js build and exercises the rendered application plus its live/fallback catalog, signals, agent, and binary orbit endpoints.
+`npm test` creates a production Next.js build and exercises the rendered application plus its live/fallback catalog, signals, history-intelligence, agent, and binary orbit endpoints.
 
 ## Project structure
 
 - `app/page.tsx` — interactive orbital experience
-- `app/api/` — catalog, signal, orbit-frame, and agent endpoints
+- `app/api/` — catalog, signal, history-intelligence, orbit-frame, and agent endpoints
 - `cloudflare/data-worker.ts` — scheduled ingestion and history API
 - `cloudflare/migrations/` — versioned D1 schema migrations
 - `cloudflare/wrangler.jsonc` — separate Preview and Production D1/R2 bindings
@@ -72,11 +73,13 @@ npm test
 
 The public GitHub repository is connected to the `2weeks-team/satellite` Vercel project. Pushes to `main` automatically create production deployments with the settings in `vercel.json`.
 
-The frontend reads recent complete signal snapshots and the latest compact catalog snapshot from `https://satellite-api.agentba.se`. If a signal snapshot is partial, unavailable, or more than six hours old—or the daily catalog snapshot is more than 36 hours old—the Vercel API falls back to the public upstream feeds. Cloudflare Cron refreshes signals every two hours and the active catalog daily; D1 keeps queryable state and run history while R2 retains raw source payloads plus a streamable compact catalog snapshot.
+The frontend reads recent complete signal snapshots, bounded history intelligence, and the latest compact catalog snapshot from `https://satellite-api.agentba.se`. If a signal snapshot is partial, unavailable, or more than six hours old—or the daily catalog snapshot is more than 36 hours old—the Vercel API falls back to the public upstream feeds. Cloudflare Cron refreshes signals every two hours and the active catalog daily; D1 keeps queryable state, signal persistence, and run/history indexes while R2 retains raw source payloads, the streamable compact catalog, and a rolling orbital-history summary.
+
+The physical trajectory remains SGP4. Historical orbital-element samples do not silently move a satellite; they calibrate confidence, orbital stability, and Sentinel/Scout/Sky priorities. The first daily snapshot is shown honestly as `collecting`; from the second distinct daily snapshot an object can be `history-calibrated`. D1 history metadata and signals are retained for 365 days, while each R2 daily archive preserves the full source snapshot for audit and later model upgrades.
 
 When CelesTrak rejects a Worker-origin request, the Worker retries those feeds through a token-protected Vercel upstream relay. Configure the same secret as `SATELLITE_UPSTREAM_PROXY_TOKEN` in Vercel and `UPSTREAM_PROXY_TOKEN` in the Worker; neither value belongs in the repository.
 
-Set `SATELLITE_DATA_API_URL=https://satellite-api.agentba.se` in Vercel so the application reads stored snapshots. `INGESTION_TOKEN` is an optional Worker secret for temporary server-to-server maintenance calls; leave it unset to keep manual ingestion disabled. Raw signal responses and a derived snapshot are archived under each signal run's R2 prefix; catalog runs archive both `active.csv` and `active.compact.json`.
+Set `SATELLITE_DATA_API_URL=https://satellite-api.agentba.se` in Vercel so the application reads stored snapshots. `INGESTION_TOKEN` is an optional Worker secret for temporary server-to-server maintenance calls; leave it unset to keep manual ingestion disabled. Raw signal responses and a derived snapshot are archived under each signal run's R2 prefix; catalog runs archive `active.csv`, `active.compact.json`, and `history.summary.json`.
 
 `GET /health` reports readiness from the latest signal data and catalog freshness. Recent failed or partial runs remain visible under `incidents` for diagnosis but do not keep a recovered service marked degraded.
 
