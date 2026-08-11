@@ -5,12 +5,35 @@ import { createServer as createTcpServer } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 
+import { searchStoredCatalog } from "../lib/catalog-snapshot.ts";
+
 const projectRoot = new URL("../", import.meta.url);
 const host = "127.0.0.1";
 let baseUrl;
 let server;
 let dataApiStub;
 let serverOutput = "";
+
+test("searches the R2 compact catalog without a D1 satellite index", () => {
+  const snapshot = {
+    status: "live",
+    source: "Test catalog via Cloudflare R2",
+    fetchedAt: "2026-08-11T00:00:00.000Z",
+    count: 2,
+    items: [
+      ["STARLINK-1", 10001, "2026-001A", "2026-08-11T00:00:00.000Z", 15, 0.001, 53, 1, 2, 3, 0, "U", 1, 1, 0.0001, 0, 0],
+      ["ISS (ZARYA)", 25544, "1998-067A", "2026-08-11T00:00:00.000Z", 15.5, 0.0004, 51.6, 120, 30, 45, 0, "U", 999, 12345, 0.0001, 0, 0],
+    ],
+  };
+  const result = searchStoredCatalog(snapshot, "iss", 25);
+  assert.equal(result.count, 1);
+  assert.equal(result.items[0].noradId, 25544);
+  assert.equal(result.items[0].objectName, "ISS (ZARYA)");
+  assert.equal(result.items[0].orbitalElements.inclination, 51.6);
+  const minimum = searchStoredCatalog(snapshot, null, 0);
+  assert.equal(minimum.count, 1);
+  assert.equal(minimum.items[0].objectName, "ISS (ZARYA)");
+});
 
 async function availablePort() {
   const probe = createTcpServer();
