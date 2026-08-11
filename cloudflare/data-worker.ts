@@ -80,6 +80,7 @@ const MAX_RELAY_BYTES = 12_000_000;
 const MAX_HISTORY_SUMMARY_BYTES = 4_400_000;
 const CATALOG_FRESHNESS_MS = 36 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const CONJUNCTION_REVISION_WINDOW_MS = 30 * 60 * 1000;
 
 function jsonResponse(request: Request, env: WorkerEnv, value: unknown, status = 200) {
   const headers = new Headers({
@@ -545,6 +546,47 @@ async function pruneRuns(db: D1Database, now: number) {
     .run();
 }
 
+async function conjunctionEventKeys(db: D1Database, items: Conjunction[]) {
+  const candidates = items.map((item, index) => [
+    index,
+    Math.min(item.id1, item.id2),
+    Math.max(item.id1, item.id2),
+    Date.parse(item.tca),
+  ]).filter((item) => Number.isFinite(item[3]));
+  if (!candidates.length) return new Map<number, string>();
+  const result = await db.prepare(`
+    WITH candidates AS (
+      SELECT
+        CAST(json_extract(value, '$[0]') AS INTEGER) AS candidate_index,
+        CAST(json_extract(value, '$[1]') AS INTEGER) AS lower_norad_id,
+        CAST(json_extract(value, '$[2]') AS INTEGER) AS upper_norad_id,
+        CAST(json_extract(value, '$[3]') AS INTEGER) AS candidate_tca
+      FROM json_each(?)
+    ), matches AS (
+      SELECT
+        candidates.candidate_index,
+        existing.event_key,
+        ROW_NUMBER() OVER (
+          PARTITION BY candidates.candidate_index
+          ORDER BY ABS(existing.tca - candidates.candidate_tca)
+        ) AS match_rank
+      FROM candidates
+      LEFT JOIN conjunction_events AS existing
+        ON MIN(existing.primary_norad_id, existing.secondary_norad_id) = candidates.lower_norad_id
+        AND MAX(existing.primary_norad_id, existing.secondary_norad_id) = candidates.upper_norad_id
+        AND ABS(existing.tca - candidates.candidate_tca) <= ?
+    )
+    SELECT
+      candidate_index AS candidateIndex,
+      event_key AS eventKey
+    FROM matches
+    WHERE match_rank = 1
+  `).bind(JSON.stringify(candidates), CONJUNCTION_REVISION_WINDOW_MS).all<Record<string, unknown>>();
+  return new Map(result.results.flatMap((row) => (
+    typeof row.eventKey === "string" ? [[Number(row.candidateIndex), row.eventKey] as const] : []
+  )));
+}
+
 async function ingestSignals(env: WorkerEnv) {
   const startedAt = Date.now();
   const parts = utcParts(startedAt);
@@ -631,10 +673,13 @@ async function ingestSignals(env: WorkerEnv) {
     }
 
     const statements: D1PreparedStatement[] = [];
-    for (const item of conjunctions) {
+    const matchedConjunctionKeys = await conjunctionEventKeys(env.DB, conjunctions);
+    for (const [index, item] of conjunctions.entries()) {
       const tca = Date.parse(item.tca);
       if (!Number.isFinite(tca)) continue;
-      const eventKey = `${item.id1}:${item.id2}:${tca}`;
+      const lowerNoradId = Math.min(item.id1, item.id2);
+      const upperNoradId = Math.max(item.id1, item.id2);
+      const eventKey = matchedConjunctionKeys.get(index) ?? `conjunction:${lowerNoradId}:${upperNoradId}:${tca}`;
       statements.push(env.DB.prepare(`
         INSERT INTO conjunction_events (
           event_key, primary_norad_id, primary_name, secondary_norad_id, secondary_name,
@@ -642,6 +687,11 @@ async function ingestSignals(env: WorkerEnv) {
           observation_count, min_range_km, peak_probability
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(event_key) DO UPDATE SET
+          primary_norad_id = excluded.primary_norad_id,
+          primary_name = excluded.primary_name,
+          secondary_norad_id = excluded.secondary_norad_id,
+          secondary_name = excluded.secondary_name,
+          tca = excluded.tca,
           range_km = excluded.range_km,
           relative_speed_km_s = excluded.relative_speed_km_s,
           max_probability = excluded.max_probability,
