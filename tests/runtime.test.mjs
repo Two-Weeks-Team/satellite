@@ -55,10 +55,47 @@ test.before(async () => {
       payload = {
         status: "live",
         fetchedAt,
-        conjunctions: [{ id1: 25544, name1: "ISS (ZARYA)", id2: 20580, name2: "HST", tca: fetchedAt, rangeKm: 1, relativeSpeed: 7.5, maxProbability: 0.01, dilutionKm: 0 }],
-        decays: [{ id: 12345, name: "TEST OBJECT", epoch: fetchedAt, meanMotion: 16, bstar: 0.001 }],
+        conjunctions: [{ id1: 25544, name1: "ISS (ZARYA)", id2: 20580, name2: "HST", tca: fetchedAt, rangeKm: 1, relativeSpeed: 7.5, maxProbability: 0.01, dilutionKm: 0, history: { observations: 4, firstSeenAt: fetchedAt, lastSeenAt: fetchedAt, minRangeKm: 0.8, peakProbability: 0.02 } }],
+        decays: [{ id: 12345, name: "TEST OBJECT", epoch: fetchedAt, meanMotion: 16, bstar: 0.001, history: { observations: 3, firstSeenAt: fetchedAt, lastSeenAt: fetchedAt, meanMotionDelta: 0.02, bstarDelta: 0.0001 } }],
         spaceWeather: { time: fetchedAt, kp: 2, level: "quiet" },
         sources: { conjunctions: "Test D1", decays: "Test D1", spaceWeather: "Test D1" },
+      };
+    } else if (pathname === "/api/intelligence") {
+      const requestedIds = (new URL(request.url ?? "/", dataApiUrl).searchParams.get("norad") ?? "")
+        .split(",")
+        .map(Number)
+        .filter((id) => Number.isInteger(id) && id > 0)
+        .slice(0, 24);
+      payload = {
+        status: "active",
+        generatedAt: fetchedAt,
+        history: {
+          baselineStartedAt: "2026-08-08T00:00:00.000Z",
+          sampleDays: 3,
+          retentionDays: 365,
+          orbitalObjects: 16323,
+          matureObjects: 16000,
+          conjunctionEvents: 24,
+          persistentConjunctions: 8,
+          decayEvents: 40,
+          persistentDecayEvents: 12,
+          weatherObservations: 4,
+        },
+        objects: requestedIds.map((noradId) => ({
+          noradId,
+          samples: 3,
+          firstObservedAt: "2026-08-08T00:00:00.000Z",
+          lastObservedAt: fetchedAt,
+          lastEpoch: fetchedAt,
+          meanMotion: 15.5,
+          bstar: 0.0004,
+          inclination: 51.6,
+          meanMotionTrendPerDay: 0.00002,
+          bstarTrendPerDay: 0.000001,
+          inclinationTrendPerDay: 0.0001,
+          stability: 0.94,
+          mode: "history-calibrated",
+        })),
       };
     } else {
       response.writeHead(404).end();
@@ -127,10 +164,11 @@ test("serves live-or-fallback catalog data within Vercel's payload limit", async
   assert.ok(bytes.byteLength < 4_500_000, `catalog payload was ${bytes.byteLength} bytes`);
 });
 
-test("serves signal, agent, and binary orbit APIs", async () => {
-  const [signalsResponse, agentResponse, orbitResponse] = await Promise.all([
+test("serves signal, history-aware agent, intelligence, and binary orbit APIs", async () => {
+  const [signalsResponse, agentResponse, intelligenceResponse, orbitResponse] = await Promise.all([
     fetch(`${baseUrl}/api/signals`, { signal: AbortSignal.timeout(15_000) }),
-    fetch(`${baseUrl}/api/agent?lat=37.5665&lon=126.978`, { signal: AbortSignal.timeout(15_000) }),
+    fetch(`${baseUrl}/api/agent?lat=37.5665&lon=126.978&norad=25544`, { signal: AbortSignal.timeout(15_000) }),
+    fetch(`${baseUrl}/api/intelligence?norad=25544`, { signal: AbortSignal.timeout(15_000) }),
     fetch(`${baseUrl}/api/orbits`, { signal: AbortSignal.timeout(15_000) }),
   ]);
 
@@ -138,12 +176,23 @@ test("serves signal, agent, and binary orbit APIs", async () => {
   const signals = await signalsResponse.json();
   assert.equal(signals.status, "live");
   assert.equal(signals.sources.conjunctions, "Test D1");
+  assert.equal(signals.conjunctions[0].history.observations, 4);
 
   assert.equal(agentResponse.status, 200);
   const agent = await agentResponse.json();
   assert.ok(["active", "degraded"].includes(agent.status));
   assert.ok(agent.monitoredObjects > 0);
   assert.equal(agent.agents.length, 3);
+  assert.equal(agent.history.sampleDays, 3);
+  assert.equal(agent.prediction.noradId, 25544);
+  assert.equal(agent.prediction.mode, "history-calibrated");
+  assert.ok(agent.events.some((event) => event.evidence.some((item) => /ingestion cycle|Historical baseline/.test(item))));
+
+  assert.equal(intelligenceResponse.status, 200);
+  const intelligence = await intelligenceResponse.json();
+  assert.equal(intelligence.status, "active");
+  assert.equal(intelligence.history.sampleDays, 3);
+  assert.equal(intelligence.objects[0].mode, "history-calibrated");
 
   assert.equal(orbitResponse.status, 200);
   assert.equal(orbitResponse.headers.get("content-type"), "application/vnd.agentbase.orbit-frame");

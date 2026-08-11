@@ -54,13 +54,33 @@ type Conjunction = {
   relativeSpeed: number;
   maxProbability: number;
   dilutionKm: number;
+  history?: {
+    observations: number;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    minRangeKm: number;
+    peakProbability: number;
+  };
 };
 
 type SignalsResponse = {
   status: "live" | "partial" | "offline";
   fetchedAt: string;
   conjunctions: Conjunction[];
-  decays: Array<{ id: number; name: string; epoch: string; meanMotion: number; bstar: number }>;
+  decays: Array<{
+    id: number;
+    name: string;
+    epoch: string;
+    meanMotion: number;
+    bstar: number;
+    history?: {
+      observations: number;
+      firstSeenAt: string;
+      lastSeenAt: string;
+      meanMotionDelta: number;
+      bstarDelta: number;
+    };
+  }>;
   spaceWeather: null | { time: string; kp: number; level: "quiet" | "active" | "storm" | "severe" };
   sources: Record<string, string>;
 };
@@ -149,6 +169,27 @@ type AgentResponse = {
   cycleStartedAt: string;
   monitoredObjects: number;
   evaluatedSignals: number;
+  history: {
+    baselineStartedAt: string | null;
+    sampleDays: number;
+    retentionDays: number;
+    orbitalObjects: number;
+    matureObjects: number;
+    conjunctionEvents: number;
+    persistentConjunctions: number;
+    decayEvents: number;
+    persistentDecayEvents: number;
+    weatherObservations: number;
+  };
+  prediction: {
+    method: string;
+    mode: "collecting" | "history-calibrated";
+    noradId: number | null;
+    samples: number;
+    stability: number;
+    confidence: number;
+    meanMotionTrendPerDay: number;
+  };
   agents: Array<{ id: string; state: string; detail: string }>;
   events: AgentEvent[];
 };
@@ -1635,7 +1676,11 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    const runAgentCycle = () => fetch(`/api/agent?lat=${observer.lat.toFixed(4)}&lon=${observer.lon.toFixed(4)}`)
+    const agentUrl = new URL("/api/agent", window.location.origin);
+    agentUrl.searchParams.set("lat", observer.lat.toFixed(4));
+    agentUrl.searchParams.set("lon", observer.lon.toFixed(4));
+    if (selectedId) agentUrl.searchParams.set("norad", String(selectedId));
+    const runAgentCycle = () => fetch(agentUrl)
       .then((response) => {
         if (!response.ok) throw new Error("Agent cycle unavailable");
         return response.json() as Promise<AgentResponse>;
@@ -1652,7 +1697,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [observer.lat, observer.lon]);
+  }, [observer.lat, observer.lon, selectedId]);
 
   useEffect(() => {
     document.documentElement.lang = locale;
@@ -1969,7 +2014,7 @@ export default function Home() {
             />
             <div className="globe-grid" aria-hidden="true" />
             <div className="globe-help"><span>DRAG</span> {t["globe.drag"]} <i /> <span>SCROLL</span> {t["globe.scroll"]} <i /> <span>CLICK</span> {t["globe.click"]}</div>
-            <div className="prediction-status"><i /><span>{t["prediction.label"]}</span><b>{t["prediction.detail"]}</b></div>
+            <div className="prediction-status"><i /><span>{t["prediction.label"]}</span><b>{agentData?.prediction.mode === "history-calibrated" ? t["history.calibrated"] : t["prediction.detail"]}</b></div>
             <div className="altitude-note">ALTITUDE VISUALLY COMPRESSED · POSITION IS SGP4</div>
             <div className="color-console" aria-label={t["color.aria"]}>
               <span>COLOR INTELLIGENCE</span>
@@ -1994,6 +2039,15 @@ export default function Home() {
                   <div><dt>{t["metric.latitude"]}</dt><dd>{formatNumber(selectedPosition.lat, locale, 2)}<small>°</small></dd></div>
                   <div><dt>{t["metric.longitude"]}</dt><dd>{formatNumber(selectedPosition.lon, locale, 2)}<small>°</small></dd></div>
                 </dl>
+                <div className={`selected-history selected-history--${agentData?.prediction.mode ?? "collecting"}`}>
+                  <span>{t["history.confidence"]}</span>
+                  <b>{agentData?.prediction.noradId === selectedEntry.id ? `${Math.round(agentData.prediction.confidence * 100)}%` : "—"}</b>
+                  <small>
+                    {agentData?.prediction.noradId === selectedEntry.id
+                      ? `${agentData.prediction.samples} ${t[agentData.prediction.samples === 1 ? "history.sample" : "history.samples"]} · ${agentData.prediction.mode === "history-calibrated" ? t["history.calibrated"] : t["history.collecting"]}`
+                      : t["history.collecting"]}
+                  </small>
+                </div>
                 <div className="selected-actions">
                   <button type="button" onClick={() => setFocusNonce((value) => value + 1)}>{t["selected.center"]}</button>
                   <button type="button" className={autonomyMode === "autopilot" ? "active" : ""} aria-pressed={autonomyMode === "autopilot"} onClick={() => changeAutonomyMode(autonomyMode === "autopilot" ? "assist" : "autopilot")}>{autonomyMode === "autopilot" ? t["story.stop"] : t["story.start"]}</button>
@@ -2008,6 +2062,15 @@ export default function Home() {
               <div className="agent-runtime__status">
                 <span><i /> {agentData ? "AX ACTIVE" : "AGENTS SYNCING"}</span>
                 <b>{agentData ? `${formatNumber(agentData.monitoredObjects, locale)} WATCHED` : "CONNECTING"}</b>
+              </div>
+              <div className={`history-runtime history-runtime--${agentData?.history.sampleDays && agentData.history.sampleDays >= 2 ? "active" : "collecting"}`}>
+                <span>{t["history.engine"]}</span>
+                <b>{agentData?.history.sampleDays ? `${agentData.history.sampleDays} ${t[agentData.history.sampleDays === 1 ? "history.sample" : "history.samples"]}` : t["history.collecting"]}</b>
+                <small>
+                  {agentData
+                    ? `${formatNumber(agentData.history.orbitalObjects, locale)} ${t["history.orbits"]} · ${agentData.history.sampleDays >= 2 ? t["history.calibrated"] : t["history.collecting"]}`
+                    : t["history.collecting"]}
+                </small>
               </div>
               <div className="autonomy-switch" role="group" aria-label={t["agent.autonomy.aria"]}>
                 {(["manual", "assist", "autopilot"] as AutonomyMode[]).map((mode) => (

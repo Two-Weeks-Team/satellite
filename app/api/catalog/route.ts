@@ -159,10 +159,10 @@ async function loadStoredCatalog(): Promise<CatalogResult | null> {
   const timeout = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS);
   try {
     const response = await fetch(`${baseUrl}/api/catalog/snapshot`, {
+      cache: "no-store",
       headers: { accept: "application/json" },
       signal: controller.signal,
-      next: { revalidate: 120 },
-    } as RequestInit & { next: { revalidate: number } });
+    });
     if (!response.ok) return null;
     const raw = await readTextWithinLimit(response, MAX_STORED_CATALOG_BYTES);
     const result: unknown = JSON.parse(raw);
