@@ -30,6 +30,7 @@ test("searches the R2 compact catalog without a D1 satellite index", () => {
   assert.equal(result.items[0].noradId, 25544);
   assert.equal(result.items[0].objectName, "ISS (ZARYA)");
   assert.equal(result.items[0].orbitalElements.inclination, 51.6);
+  assert.equal(searchStoredCatalog(snapshot, null, 0).count, 1);
 });
 
 async function availablePort() {

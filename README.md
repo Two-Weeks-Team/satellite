@@ -234,7 +234,7 @@ To exercise the application against the stored production snapshots without addi
 SATELLITE_DATA_API_URL=https://satellite-api.agentba.se npm run dev
 ```
 
-Cloudflare Preview development uses the Preview D1/R2 bindings and exposes the local scheduled-handler test endpoint:
+Cloudflare Preview development selects the Preview configuration but uses local D1/R2 emulators. It also exposes the local scheduled-handler test endpoint:
 
 ```bash
 npm run cf:dev
@@ -307,8 +307,12 @@ For destructive compatibility migrations such as removing the former D1 catalog 
 ```bash
 npm run cf:deploy:preview
 curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/health?proof=pre-migration'
+curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/api/catalog/snapshot' >/dev/null
+curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/api/catalog/latest?q=ISS%20%28ZARYA%29&limit=1' | grep -q '"noradId":25544'
 npm run cf:migrate:preview
 curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/health?proof=post-migration'
+curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/api/catalog/snapshot' >/dev/null
+curl -fsS 'https://satellite-data-api-preview.sgwannabe.workers.dev/api/catalog/latest?q=ISS%20%28ZARYA%29&limit=1' | grep -q '"noradId":25544'
 ```
 
 Validate the deployment URL reported by Wrangler. Preview intentionally has no Cron, so use local scheduled-handler testing or an explicitly authorized manual ingestion token when ingestion proof is required.
@@ -324,8 +328,12 @@ Worker/D1/R2 changes require an explicit production step after Preview proof. Us
 ```bash
 npm run cf:deploy:production
 curl -fsS 'https://satellite-api.agentba.se/health?proof=pre-migration'
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/snapshot' >/dev/null
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/latest?q=ISS%20%28ZARYA%29&limit=1' | grep -q '"noradId":25544'
 npm run cf:migrate:production
 curl -fsS 'https://satellite-api.agentba.se/health?proof=post-migration'
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/snapshot' >/dev/null
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/latest?q=ISS%20%28ZARYA%29&limit=1' | grep -q '"noradId":25544'
 ```
 
 Migrations and production deployment are state-changing operations. Confirm the active Wrangler account/profile and exact resource names before executing them. Never apply Preview bindings to Production or Production bindings to Preview.
@@ -334,6 +342,8 @@ Migrations and production deployment are state-changing operations. Confirm the 
 
 ```bash
 curl -fsS https://satellite-api.agentba.se/health
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/snapshot' >/dev/null
+curl -fsS 'https://satellite-api.agentba.se/api/catalog/latest?q=ISS%20%28ZARYA%29&limit=1' | grep -q '"noradId":25544'
 curl -fsSI https://satellite.agentba.se/
 curl -fsS 'https://satellite.agentba.se/api/intelligence?norad=25544'
 ```

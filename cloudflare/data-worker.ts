@@ -892,6 +892,17 @@ async function ingestCatalog(env: WorkerEnv, force = false) {
       count: objects.length,
       items: objects.map(compactCatalogObject),
     };
+    const compactPayload = JSON.stringify(compactSnapshot);
+    const compactBytes = new TextEncoder().encode(compactPayload).byteLength;
+    if (compactBytes > MAX_COMPACT_CATALOG_BYTES) {
+      console.error(JSON.stringify({
+        message: "compact catalog exceeds storage limit",
+        bytes: compactBytes,
+        limit: MAX_COMPACT_CATALOG_BYTES,
+        objects: compactSnapshot.count,
+      }));
+      throw new Error(`Compact catalog is ${compactBytes} bytes; limit is ${MAX_COMPACT_CATALOG_BYTES}`);
+    }
     const historySummary = buildHistorySummary(objects, previousHistory, parts.date, startedAt);
     const historyPayload = JSON.stringify(historySummary);
     const historyBytes = new TextEncoder().encode(historyPayload).byteLength;
@@ -906,7 +917,7 @@ async function ingestCatalog(env: WorkerEnv, force = false) {
     }
     await Promise.all([
       putArchive(env.ARCHIVE, archiveKey, csv, "text/csv"),
-      putArchive(env.ARCHIVE, compactArchiveKey, JSON.stringify(compactSnapshot), "application/json"),
+      putArchive(env.ARCHIVE, compactArchiveKey, compactPayload, "application/json"),
       putArchive(env.ARCHIVE, historyArchiveKey, historyPayload, "application/json"),
     ]);
     await env.DB.batch([
@@ -1126,16 +1137,26 @@ async function catalogLatestResponse(request: Request, env: WorkerEnv) {
     return jsonResponse(request, env, { error: "Compact catalog snapshot exceeds lookup limit" }, 503);
   }
   const headers = new Headers({ "Content-Length": String(object.size) });
-  const raw = await readTextWithinLimit(new Response(object.body, { headers }), MAX_COMPACT_CATALOG_BYTES);
-  const parsed: unknown = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    const raw = await readTextWithinLimit(new Response(object.body, { headers }), MAX_COMPACT_CATALOG_BYTES);
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "compact catalog lookup read failed",
+      error: errorMessage(error),
+    }));
+    return jsonResponse(request, env, { error: "Compact catalog snapshot is invalid" }, 503);
+  }
   if (!isStoredCatalogSnapshot(parsed)) {
     return jsonResponse(request, env, { error: "Compact catalog snapshot is invalid" }, 503);
   }
   const url = new URL(request.url);
+  const requestedLimit = url.searchParams.get("limit");
   return jsonResponse(
     request,
     env,
-    searchStoredCatalog(parsed, url.searchParams.get("q"), Number(url.searchParams.get("limit")) || 25),
+    searchStoredCatalog(parsed, url.searchParams.get("q"), requestedLimit === null ? 25 : Number(requestedLimit)),
   );
 }
 
