@@ -153,7 +153,7 @@ type AgentEvent = {
   title: Record<Locale, string>;
   body: Record<Locale, string>;
   confidence: number;
-  evidence: string[];
+  evidence: LocalizedValue[];
   createdAt: string;
   action: {
     focusIds?: number[];
@@ -190,9 +190,15 @@ type AgentResponse = {
     confidence: number;
     meanMotionTrendPerDay: number;
   };
-  agents: Array<{ id: string; state: string; detail: string }>;
+  agents: Array<{ id: string; state: LocalizedValue; detail: LocalizedValue }>;
   events: AgentEvent[];
 };
+
+type LocalizedValue = string | Record<Locale, string>;
+
+function localText(value: LocalizedValue, locale: Locale) {
+  return typeof value === "string" ? value : value[locale];
+}
 
 const categoryMeta: Array<{ id: Category; labelKey: string; short: string }> = [
   { id: "all", labelKey: "category.all", short: "ALL" },
@@ -2079,10 +2085,10 @@ export default function Home() {
               </div>
               <div className="agent-roster">
                 {(agentData?.agents ?? [
-                  { id: "SENTINEL", state: "syncing", detail: "Risk scan" },
-                  { id: "SCOUT", state: "syncing", detail: "Pattern scan" },
-                  { id: "SKY", state: "syncing", detail: "Pass scan" },
-                ]).map((agent) => <span key={agent.id} title={agent.detail}><i /> <b>{agent.id}</b> {agent.state}</span>)}
+                  { id: "SENTINEL", state: { en: "syncing", ko: "동기화 중", ja: "同期中" }, detail: { en: "Risk scan", ko: "위험 스캔", ja: "リスクスキャン" } },
+                  { id: "SCOUT", state: { en: "syncing", ko: "동기화 중", ja: "同期中" }, detail: { en: "Pattern scan", ko: "패턴 스캔", ja: "パターンスキャン" } },
+                  { id: "SKY", state: { en: "syncing", ko: "동기화 중", ja: "同期中" }, detail: { en: "Pass scan", ko: "통과 스캔", ja: "通過スキャン" } },
+                ]).map((agent) => <span key={agent.id} title={localText(agent.detail, locale)}><i /> <b>{agent.id}</b> {localText(agent.state, locale)}</span>)}
               </div>
             </div>
             <div className="agent-tabs" role="tablist" aria-label={t["tabs.aria"]}>
@@ -2104,7 +2110,7 @@ export default function Home() {
                       <h3>{event.title[locale]}</h3>
                       <p>{event.body[locale]}</p>
                       <div className="mission-event__meta"><span>{Math.round(event.confidence * 100)}% {t["agent.confidence"]}</span><time>{relativeTime(event.createdAt, simulationTime, locale)}</time></div>
-                      <details><summary>{t["agent.evidence"]}</summary>{event.evidence.map((item) => <small key={item}>{item}</small>)}</details>
+                      <details><summary>{t["agent.evidence"]}</summary>{event.evidence.map((item) => <small key={localText(item, "en")}>{localText(item, locale)}</small>)}</details>
                       <button type="button" onClick={() => applyAgentEvent(event)}>{t["agent.show"]} <span>→</span></button>
                     </article>
                   )) ?? <div className="agent-cycle-skeleton"><i /><i /><i /></div>}

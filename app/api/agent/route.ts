@@ -13,7 +13,7 @@ type AgentEvent = {
   title: LocalizedText;
   body: LocalizedText;
   confidence: number;
-  evidence: string[];
+  evidence: LocalizedText[];
   createdAt: string;
   action: {
     focusIds?: number[];
@@ -81,10 +81,31 @@ function predictionConfidence(insight: HistoryObjectInsight | undefined) {
   return clamp(0.5 + insight.stability * 0.4 + Math.min(0.08, insight.samples * 0.02), 0.5, 0.96);
 }
 
-function historyEvidence(insight: HistoryObjectInsight | undefined) {
-  if (!insight) return "Historical orbital baseline unavailable";
-  if (insight.samples < 2) return "Historical baseline: 1 daily sample · calibration collecting";
-  return `Historical baseline: ${insight.samples} daily samples · ${Math.round(insight.stability * 100)}% stability`;
+function localized(en: string, ko: string, ja: string): LocalizedText {
+  return { en, ko, ja };
+}
+
+function historyEvidence(insight: HistoryObjectInsight | undefined): LocalizedText {
+  if (!insight) {
+    return localized(
+      "Historical orbital baseline unavailable",
+      "과거 궤도 기준선을 사용할 수 없음",
+      "過去の軌道ベースラインを利用できません",
+    );
+  }
+  if (insight.samples < 2) {
+    return localized(
+      "Historical baseline: 1 daily sample · calibration collecting",
+      "과거 기준선: 일별 표본 1개 · 보정 데이터 수집 중",
+      "過去ベースライン: 日次サンプル1件 · 較正データ収集中",
+    );
+  }
+  const stability = Math.round(insight.stability * 100);
+  return localized(
+    `Historical baseline: ${insight.samples} daily samples · ${stability}% stability`,
+    `과거 기준선: 일별 표본 ${insight.samples}개 · 안정도 ${stability}%`,
+    `過去ベースライン: 日次サンプル${insight.samples}件 · 安定度${stability}%`,
+  );
 }
 
 export async function GET(request: Request) {
@@ -129,10 +150,22 @@ export async function GET(request: Request) {
       },
       confidence: clamp(0.72 + Math.min(0.16, observations * 0.02) + (topConjunction.history ? 0.03 : 0), 0.72, 0.93),
       evidence: [
-        "CelesTrak SOCRATES Plus",
-        `Observed in ${observations} ingestion cycle${observations === 1 ? "" : "s"}`,
-        `Minimum recorded range ${((topConjunction.history?.minRangeKm ?? topConjunction.rangeKm) * 1000).toFixed(0)} m`,
-        `TCA ${topConjunction.tca} · ${topConjunction.relativeSpeed.toFixed(2)} km/s`,
+        localized("CelesTrak SOCRATES Plus", "CelesTrak SOCRATES Plus", "CelesTrak SOCRATES Plus"),
+        localized(
+          `Observed in ${observations} ingestion cycle${observations === 1 ? "" : "s"}`,
+          `${observations}회 수집 주기에서 관측`,
+          `${observations}回の収集サイクルで観測`,
+        ),
+        localized(
+          `Minimum recorded range ${((topConjunction.history?.minRangeKm ?? topConjunction.rangeKm) * 1000).toFixed(0)} m`,
+          `기록된 최소 거리 ${((topConjunction.history?.minRangeKm ?? topConjunction.rangeKm) * 1000).toFixed(0)} m`,
+          `記録された最小距離 ${((topConjunction.history?.minRangeKm ?? topConjunction.rangeKm) * 1000).toFixed(0)} m`,
+        ),
+        localized(
+          `TCA ${topConjunction.tca} · ${topConjunction.relativeSpeed.toFixed(2)} km/s`,
+          `최근접 시각 ${topConjunction.tca} · ${topConjunction.relativeSpeed.toFixed(2)} km/s`,
+          `最接近時刻 ${topConjunction.tca} · ${topConjunction.relativeSpeed.toFixed(2)} km/s`,
+        ),
       ],
       createdAt: cycleStartedAt.toISOString(),
       action: { focusIds: [topConjunction.id1, topConjunction.id2], filter: "all", colorMode: "risk", panel: "risk", timeAt: topConjunction.tca },
@@ -154,10 +187,10 @@ export async function GET(request: Request) {
       },
       confidence: clamp(0.58 + Math.min(0.24, baselineDays * 0.04) + (focusInsight?.stability ?? 0) * 0.12, 0.58, 0.94),
       evidence: [
-        "CelesTrak active catalog",
-        `${shells.size} inclination families`,
+        localized("CelesTrak active catalog", "CelesTrak 활성 카탈로그", "CelesTrakアクティブカタログ"),
+        localized(`${shells.size} inclination families`, `${shells.size}개 경사각 계열`, `${shells.size}つの軌道傾斜角グループ`),
         historyEvidence(focusInsight),
-        `Catalog epoch ${catalog.fetchedAt}`,
+        localized(`Catalog epoch ${catalog.fetchedAt}`, `카탈로그 기준 시각 ${catalog.fetchedAt}`, `カタログ基準時刻 ${catalog.fetchedAt}`),
       ],
       createdAt: cycleStartedAt.toISOString(),
       action: { focusIds: [scoutFocus[1]], filter: "starlink", colorMode: "constellation", panel: "discover" },
@@ -182,9 +215,17 @@ export async function GET(request: Request) {
       },
       confidence: clamp(0.58 + Math.min(0.28, observations * 0.035), 0.58, 0.88),
       evidence: [
-        "CelesTrak Potential Decays",
-        `Observed in ${observations} ingestion cycle${observations === 1 ? "" : "s"}`,
-        `BSTAR change ${(topDecay.history?.bstarDelta ?? 0).toExponential(2)}`,
+        localized("CelesTrak Potential Decays", "CelesTrak 추락 후보", "CelesTrak落下候補"),
+        localized(
+          `Observed in ${observations} ingestion cycle${observations === 1 ? "" : "s"}`,
+          `${observations}회 수집 주기에서 관측`,
+          `${observations}回の収集サイクルで観測`,
+        ),
+        localized(
+          `BSTAR change ${(topDecay.history?.bstarDelta ?? 0).toExponential(2)}`,
+          `BSTAR 변화 ${(topDecay.history?.bstarDelta ?? 0).toExponential(2)}`,
+          `BSTAR変化 ${(topDecay.history?.bstarDelta ?? 0).toExponential(2)}`,
+        ),
       ],
       createdAt: cycleStartedAt.toISOString(),
       action: { focusIds: [topDecay.id], filter: "all", colorMode: "risk", panel: "risk" },
@@ -205,7 +246,16 @@ export async function GET(request: Request) {
         ja: `NOAAの現在値はKp ${kp}です。測位衛星と低軌道物体への影響を監視します。`,
       },
       confidence: clamp(0.9 + Math.min(0.09, intelligence.history.weatherObservations * 0.005), 0.9, 0.99),
-      evidence: ["NOAA SWPC", `Kp ${kp}`, `${intelligence.history.weatherObservations} retained observations`, signals.spaceWeather.time],
+      evidence: [
+        localized("NOAA SWPC", "NOAA SWPC", "NOAA SWPC"),
+        localized(`Kp ${kp}`, `Kp ${kp}`, `Kp ${kp}`),
+        localized(
+          `${intelligence.history.weatherObservations} retained observations`,
+          `관측 기록 ${intelligence.history.weatherObservations}개 보존`,
+          `観測記録${intelligence.history.weatherObservations}件を保持`,
+        ),
+        localized(signals.spaceWeather.time, signals.spaceWeather.time, signals.spaceWeather.time),
+      ],
       createdAt: cycleStartedAt.toISOString(),
       action: { filter: signals.spaceWeather.kp >= 5 ? "navigation" : "all", colorMode: signals.spaceWeather.kp >= 5 ? "risk" : "type", panel: "discover" },
     });
@@ -225,10 +275,20 @@ export async function GET(request: Request) {
       },
       confidence: predictionConfidence(passInsight),
       evidence: [
-        "SGP4 public GP prediction",
+        localized("SGP4 public GP prediction", "SGP4 공개 GP 예측", "SGP4公開GP予測"),
         historyEvidence(passInsight),
-        passInsight ? `Mean-motion trend ${passInsight.meanMotionTrendPerDay.toExponential(2)} rev/day²` : "Calibration pending",
-        `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}° · minimum elevation 12°`,
+        passInsight
+          ? localized(
+            `Mean-motion trend ${passInsight.meanMotionTrendPerDay.toExponential(2)} rev/day²`,
+            `평균 운동 추세 ${passInsight.meanMotionTrendPerDay.toExponential(2)} rev/day²`,
+            `平均運動トレンド ${passInsight.meanMotionTrendPerDay.toExponential(2)} rev/day²`,
+          )
+          : localized("Calibration pending", "보정 대기 중", "較正待機中"),
+        localized(
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}° · minimum elevation 12°`,
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}° · 최소 고도 12°`,
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}° · 最小仰角12°`,
+        ),
       ],
       createdAt: cycleStartedAt.toISOString(),
       action: { focusIds: [nextPass.tuple[1]], filter: "station", colorMode: "type", panel: "sky", timeAt: nextPass.pass.time.toISOString() },
@@ -254,9 +314,35 @@ export async function GET(request: Request) {
       meanMotionTrendPerDay: predictionInsight?.meanMotionTrendPerDay ?? 0,
     },
     agents: [
-      { id: "SENTINEL", state: "watching history", detail: `${intelligence.history.persistentConjunctions} persistent conjunctions · ${intelligence.history.persistentDecayEvents} persistent decays` },
-      { id: "SCOUT", state: "mapping change", detail: `${starlinks.length} Starlink objects · ${intelligence.history.sampleDays} history days` },
-      { id: "SKY", state: predictionInsight?.mode ?? "collecting baseline", detail: `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}°` },
+      {
+        id: "SENTINEL",
+        state: localized("watching history", "이력 감시 중", "履歴を監視中"),
+        detail: localized(
+          `${intelligence.history.persistentConjunctions} persistent conjunctions · ${intelligence.history.persistentDecayEvents} persistent decays`,
+          `지속 근접접근 ${intelligence.history.persistentConjunctions}건 · 지속 추락 후보 ${intelligence.history.persistentDecayEvents}건`,
+          `継続接近${intelligence.history.persistentConjunctions}件 · 継続落下候補${intelligence.history.persistentDecayEvents}件`,
+        ),
+      },
+      {
+        id: "SCOUT",
+        state: localized("mapping change", "변화 지도화 중", "変化をマッピング中"),
+        detail: localized(
+          `${starlinks.length} Starlink objects · ${intelligence.history.sampleDays} history days`,
+          `Starlink ${starlinks.length}개 · 이력 ${intelligence.history.sampleDays}일`,
+          `Starlink ${starlinks.length}機 · 履歴${intelligence.history.sampleDays}日`,
+        ),
+      },
+      {
+        id: "SKY",
+        state: predictionInsight?.mode === "history-calibrated"
+          ? localized("history-calibrated", "이력 보정 완료", "履歴による較正済み")
+          : localized("collecting baseline", "기준선 수집 중", "ベースライン収集中"),
+        detail: localized(
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}°`,
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}°`,
+          `${observer.lat.toFixed(2)}°, ${observer.lon.toFixed(2)}°`,
+        ),
+      },
     ],
     events: events.slice(0, 6),
   }, { headers: { "Cache-Control": "public, s-maxage=120, stale-while-revalidate=300" } });

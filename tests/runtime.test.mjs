@@ -186,7 +186,13 @@ test("serves signal, history-aware agent, intelligence, and binary orbit APIs", 
   assert.equal(agent.history.sampleDays, 3);
   assert.equal(agent.prediction.noradId, 25544);
   assert.equal(agent.prediction.mode, "history-calibrated");
-  assert.ok(agent.events.some((event) => event.evidence.some((item) => /ingestion cycle|Historical baseline/.test(item))));
+  const historicalEvidence = agent.events
+    .flatMap((event) => event.evidence)
+    .find((item) => /ingestion cycle|Historical baseline/.test(item.en));
+  assert.ok(historicalEvidence);
+  assert.ok(historicalEvidence.ko.length > 0);
+  assert.ok(historicalEvidence.ja.length > 0);
+  assert.equal(typeof agent.agents[0].state.ko, "string");
 
   assert.equal(intelligenceResponse.status, 200);
   const intelligence = await intelligenceResponse.json();
