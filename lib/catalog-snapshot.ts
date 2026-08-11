@@ -47,6 +47,8 @@ export type CatalogLookupItem = {
   };
 };
 
+const catalogNameCollator = new Intl.Collator("en-US", { sensitivity: "base" });
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -108,10 +110,20 @@ export function searchStoredCatalog(
 ) {
   const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 25));
   const normalizedQuery = query?.trim().toLocaleLowerCase("en-US") ?? "";
-  const items = snapshot.items
-    .filter((item) => !normalizedQuery || item[0].toLocaleLowerCase("en-US").includes(normalizedQuery))
-    .sort((left, right) => left[0].localeCompare(right[0], "en-US", { sensitivity: "base" }))
-    .slice(0, limit)
-    .map(catalogLookupItem);
+  const selected: CompactOmm[] = [];
+  for (const item of snapshot.items) {
+    if (normalizedQuery && !item[0].toLocaleLowerCase("en-US").includes(normalizedQuery)) continue;
+    if (selected.length === limit && catalogNameCollator.compare(item[0], selected[selected.length - 1][0]) >= 0) continue;
+    let lower = 0;
+    let upper = selected.length;
+    while (lower < upper) {
+      const middle = (lower + upper) >>> 1;
+      if (catalogNameCollator.compare(selected[middle][0], item[0]) <= 0) lower = middle + 1;
+      else upper = middle;
+    }
+    selected.splice(lower, 0, item);
+    if (selected.length > limit) selected.pop();
+  }
+  const items = selected.map(catalogLookupItem);
   return { count: items.length, items };
 }
