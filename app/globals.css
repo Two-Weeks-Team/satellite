@@ -1022,7 +1022,7 @@ a {
 .history-runtime > b { color: var(--soft); }
 
 .history-runtime > small {
-  color: var(--muted);
+  color: var(--soft);
   font-size: 7px;
   grid-column: 1 / -1;
 }

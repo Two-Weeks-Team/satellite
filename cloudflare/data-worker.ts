@@ -386,6 +386,11 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function roundForStorage(value: number, decimalPlaces: number) {
+  const factor = 10 ** decimalPlaces;
+  return Math.round(value * factor) / factor;
+}
+
 function historyStability(
   samples: number,
   meanMotionTrend: number,
@@ -420,9 +425,9 @@ function buildHistorySummary(
   const sameSnapshotDay = previous?.snapshotDate === snapshotDate;
   const items = objects.map((item): StoredHistoryTuple => {
     const orbital = JSON.parse(item.orbitalElements) as Record<string, unknown>;
-    const meanMotion = finiteNumber(orbital.meanMotion);
-    const bstar = finiteNumber(orbital.bstar);
-    const inclination = finiteNumber(orbital.inclination);
+    const meanMotion = roundForStorage(finiteNumber(orbital.meanMotion), 8);
+    const bstar = roundForStorage(finiteNumber(orbital.bstar), 12);
+    const inclination = roundForStorage(finiteNumber(orbital.inclination), 6);
     const prior = previousByNorad.get(item.noradId);
     if (!prior) {
       return [
@@ -437,7 +442,7 @@ function buildHistorySummary(
         0,
         0,
         0,
-        historyStability(1, 0, 0, 0, bstar),
+        roundForStorage(historyStability(1, 0, 0, 0, bstar), 4),
       ];
     }
 
@@ -446,9 +451,9 @@ function buildHistorySummary(
     const bstarDelta = (bstar - prior[6]) / elapsedDays;
     const inclinationDelta = (inclination - prior[7]) / elapsedDays;
     const samples = sameSnapshotDay ? prior[1] : prior[1] + 1;
-    const meanMotionTrend = sameSnapshotDay ? prior[8] : prior[8] * 0.7 + meanMotionDelta * 0.3;
-    const bstarTrend = sameSnapshotDay ? prior[9] : prior[9] * 0.7 + bstarDelta * 0.3;
-    const inclinationTrend = sameSnapshotDay ? prior[10] : prior[10] * 0.7 + inclinationDelta * 0.3;
+    const meanMotionTrend = roundForStorage(sameSnapshotDay ? prior[8] : prior[8] * 0.7 + meanMotionDelta * 0.3, 10);
+    const bstarTrend = roundForStorage(sameSnapshotDay ? prior[9] : prior[9] * 0.7 + bstarDelta * 0.3, 12);
+    const inclinationTrend = roundForStorage(sameSnapshotDay ? prior[10] : prior[10] * 0.7 + inclinationDelta * 0.3, 8);
     return [
       item.noradId,
       samples,
@@ -461,7 +466,7 @@ function buildHistorySummary(
       meanMotionTrend,
       bstarTrend,
       inclinationTrend,
-      historyStability(samples, meanMotionTrend, bstarTrend, inclinationTrend, bstar),
+      roundForStorage(historyStability(samples, meanMotionTrend, bstarTrend, inclinationTrend, bstar), 4),
     ];
   });
   return {
@@ -476,24 +481,86 @@ function buildHistorySummary(
   };
 }
 
-async function historySummaryFromArchive(bucket: R2Bucket, archiveKey: string) {
-  const object = await bucket.get(archiveKey);
-  if (!object || object.size > MAX_HISTORY_SUMMARY_BYTES) return null;
-  const headers = new Headers({ "Content-Length": String(object.size) });
-  const raw = await readTextWithinLimit(new Response(object.body, { headers }), MAX_HISTORY_SUMMARY_BYTES);
+function parsedHistorySummary(raw: string) {
   const parsed: unknown = JSON.parse(raw);
   return isStoredHistorySummary(parsed) ? parsed : null;
 }
 
+let inMemoryHistory: {
+  archiveKey: string;
+  generatedAt: number;
+  summary: StoredHistorySummary;
+} | null = null;
+
+async function historySummaryFromArchive(env: WorkerEnv, archiveKey: string, generatedAt: number) {
+  if (inMemoryHistory?.archiveKey === archiveKey && inMemoryHistory.generatedAt === generatedAt) {
+    return inMemoryHistory.summary;
+  }
+  const cacheKey = new Request(
+    `https://satellite-api.agentba.se/__history-cache/${env.ENVIRONMENT}/${encodeURIComponent(archiveKey)}?generatedAt=${generatedAt}`,
+  );
+  const historyCache = await caches.open(`satellite-history-${env.ENVIRONMENT}`);
+  try {
+    const cached = await historyCache.match(cacheKey);
+    if (cached) {
+      const raw = await readTextWithinLimit(cached, MAX_HISTORY_SUMMARY_BYTES);
+      const summary = parsedHistorySummary(raw);
+      if (summary) {
+        inMemoryHistory = { archiveKey, generatedAt, summary };
+        return summary;
+      }
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({
+      message: "history cache read failed",
+      archiveKey,
+      error: errorMessage(error),
+    }));
+  }
+
+  const object = await env.ARCHIVE.get(archiveKey);
+  if (!object) return null;
+  if (object.size > MAX_HISTORY_SUMMARY_BYTES) {
+    console.error(JSON.stringify({
+      message: "history summary exceeds read limit",
+      archiveKey,
+      bytes: object.size,
+      limit: MAX_HISTORY_SUMMARY_BYTES,
+    }));
+    return null;
+  }
+  const headers = new Headers({ "Content-Length": String(object.size) });
+  const raw = await readTextWithinLimit(new Response(object.body, { headers }), MAX_HISTORY_SUMMARY_BYTES);
+  const summary = parsedHistorySummary(raw);
+  if (!summary) return null;
+  inMemoryHistory = { archiveKey, generatedAt, summary };
+  try {
+    await historyCache.put(cacheKey, new Response(raw, {
+      headers: {
+        "Cache-Control": "public, max-age=86400",
+        "Content-Length": String(object.size),
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    }));
+  } catch (error) {
+    console.warn(JSON.stringify({
+      message: "history cache write failed",
+      archiveKey,
+      error: errorMessage(error),
+    }));
+  }
+  return summary;
+}
+
 async function latestHistorySummary(env: WorkerEnv) {
   const row = await env.DB.prepare(`
-    SELECT archive_key AS archiveKey
+    SELECT archive_key AS archiveKey, generated_at AS generatedAt
     FROM history_snapshots
     ORDER BY generated_at DESC
     LIMIT 1
   `).first<Record<string, unknown>>();
   if (!row?.archiveKey) return null;
-  return historySummaryFromArchive(env.ARCHIVE, String(row.archiveKey));
+  return historySummaryFromArchive(env, String(row.archiveKey), Number(row.generatedAt));
 }
 
 function utcParts(timestamp: number) {
@@ -859,10 +926,21 @@ async function ingestCatalog(env: WorkerEnv, force = false) {
       items: objects.map(compactCatalogObject),
     };
     const historySummary = buildHistorySummary(objects, previousHistory, parts.date, startedAt);
+    const historyPayload = JSON.stringify(historySummary);
+    const historyBytes = new TextEncoder().encode(historyPayload).byteLength;
+    if (historyBytes > MAX_HISTORY_SUMMARY_BYTES) {
+      console.error(JSON.stringify({
+        message: "history summary exceeds storage limit",
+        bytes: historyBytes,
+        limit: MAX_HISTORY_SUMMARY_BYTES,
+        objects: historySummary.objectCount,
+      }));
+      throw new Error(`History summary is ${historyBytes} bytes; limit is ${MAX_HISTORY_SUMMARY_BYTES}`);
+    }
     await Promise.all([
       putArchive(env.ARCHIVE, archiveKey, csv, "text/csv"),
       putArchive(env.ARCHIVE, compactArchiveKey, JSON.stringify(compactSnapshot), "application/json"),
-      putArchive(env.ARCHIVE, historyArchiveKey, JSON.stringify(historySummary), "application/json"),
+      putArchive(env.ARCHIVE, historyArchiveKey, historyPayload, "application/json"),
     ]);
     await upsertCatalog(env.DB, objects, startedAt);
     await env.DB.prepare("DELETE FROM satellites WHERE ingested_at < ?").bind(startedAt).run();

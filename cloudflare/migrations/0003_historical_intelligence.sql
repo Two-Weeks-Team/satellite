@@ -6,14 +6,6 @@ UPDATE conjunction_events
 SET min_range_km = range_km,
     peak_probability = max_probability;
 
-ALTER TABLE decay_events ADD COLUMN observation_count INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE decay_events ADD COLUMN first_mean_motion REAL NOT NULL DEFAULT 0;
-ALTER TABLE decay_events ADD COLUMN first_bstar REAL NOT NULL DEFAULT 0;
-
-UPDATE decay_events
-SET first_mean_motion = mean_motion,
-    first_bstar = bstar;
-
 CREATE TABLE decay_events_history (
   event_key TEXT PRIMARY KEY,
   norad_id INTEGER NOT NULL,

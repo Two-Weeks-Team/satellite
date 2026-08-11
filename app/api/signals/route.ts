@@ -157,16 +157,19 @@ async function cachedFetchText(url: string, accept: string, maxBytes = MAX_SIGNA
   }
 }
 
+function isSignalHistory(history: unknown, extraKeys: readonly string[]) {
+  if (history === undefined) return true;
+  if (!history || typeof history !== "object") return false;
+  const record = history as Record<string, unknown>;
+  return Number.isInteger(record.observations) && Number(record.observations) > 0
+    && typeof record.firstSeenAt === "string" && Number.isFinite(Date.parse(record.firstSeenAt))
+    && typeof record.lastSeenAt === "string" && Number.isFinite(Date.parse(record.lastSeenAt))
+    && extraKeys.every((key) => Number.isFinite(record[key]));
+}
+
 function isConjunction(value: unknown): value is Conjunction {
   const candidate = value as Partial<Conjunction> | null;
-  const history = candidate?.history;
-  const historyValid = history === undefined || (
-    typeof history === "object"
-    && Number.isInteger(history.observations) && history.observations > 0
-    && typeof history.firstSeenAt === "string" && Number.isFinite(Date.parse(history.firstSeenAt))
-    && typeof history.lastSeenAt === "string" && Number.isFinite(Date.parse(history.lastSeenAt))
-    && Number.isFinite(history.minRangeKm) && Number.isFinite(history.peakProbability)
-  );
+  const historyValid = isSignalHistory(candidate?.history, ["minRangeKm", "peakProbability"]);
   return !!candidate && typeof candidate === "object"
     && Number.isFinite(candidate.id1) && Number.isFinite(candidate.id2)
     && typeof candidate.name1 === "string" && typeof candidate.name2 === "string"
@@ -178,14 +181,7 @@ function isConjunction(value: unknown): value is Conjunction {
 
 function isDecay(value: unknown): value is Decay {
   const candidate = value as Partial<Decay> | null;
-  const history = candidate?.history;
-  const historyValid = history === undefined || (
-    typeof history === "object"
-    && Number.isInteger(history.observations) && history.observations > 0
-    && typeof history.firstSeenAt === "string" && Number.isFinite(Date.parse(history.firstSeenAt))
-    && typeof history.lastSeenAt === "string" && Number.isFinite(Date.parse(history.lastSeenAt))
-    && Number.isFinite(history.meanMotionDelta) && Number.isFinite(history.bstarDelta)
-  );
+  const historyValid = isSignalHistory(candidate?.history, ["meanMotionDelta", "bstarDelta"]);
   return !!candidate && typeof candidate === "object"
     && Number.isFinite(candidate.id) && typeof candidate.name === "string"
     && typeof candidate.epoch === "string" && Number.isFinite(Date.parse(candidate.epoch))

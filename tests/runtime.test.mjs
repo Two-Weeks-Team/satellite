@@ -64,7 +64,8 @@ test.before(async () => {
       const requestedIds = (new URL(request.url ?? "/", dataApiUrl).searchParams.get("norad") ?? "")
         .split(",")
         .map(Number)
-        .filter(Number.isInteger);
+        .filter((id) => Number.isInteger(id) && id > 0)
+        .slice(0, 24);
       payload = {
         status: "active",
         generatedAt: fetchedAt,
